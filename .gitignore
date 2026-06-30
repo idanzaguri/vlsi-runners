@@ -1,0 +1,6 @@
+# Python bytecode cache (created next to source on every `python3 foo.py`
+# invocation that didn't pass -B). The activate.sh shell functions already
+# use -B so they leave no cache; this just covers direct invocations.
+__pycache__/
+*.pyc
+*.pyo
