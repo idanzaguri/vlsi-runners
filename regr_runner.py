@@ -35,6 +35,8 @@ def _timed_out_but_finished_cleanly(text):
 
 global wa_root
 
+_TEST_RUNNER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_runner.py")
+
 # Registry of currently running test subprocesses so a Ctrl-C handler can kill them.
 _running_procs = {}
 _running_procs_lock = threading.Lock()
@@ -64,7 +66,7 @@ def _terminate_running_procs(grace=2):
 
 def run_test(block, test, seed, rundir, codecov=False, simulator="modelsim"):
     """Runs a single test instance with the given parameters."""
-    cmd = f"python3 {wa_root}/bin/test_runner.py --block {block} --test {test} --seed {seed} --rundir {rundir} --simulator {simulator}"
+    cmd = f"python3 {_TEST_RUNNER} --block {block} --test {test} --seed {seed} --rundir {rundir} --simulator {simulator}"
     if codecov:
         cmd += " --codecov"
 
