@@ -1,6 +1,6 @@
 #!/bin/bash
 
-_test_runner_completion() {
+_synth_runner_completion() {
     local cur prev words cword
     # Initialize completion variables.
     # If _init_completion is available (from bash-completion), you can use:
@@ -12,30 +12,18 @@ _test_runner_completion() {
     repo_top=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
     
     # Define the available options.
-    local opts="--block --test --simulator --top --dut --clean --pedant --rundir --rundir-suffix --files --seed --verbosity --uvm_test --uvm_max_quit --compile_only --run_only --gui --dump --dump-mem --codecov --sim_args --comp_args -h"
+    local opts="--block --top --clean --pedant --rundir --files --synth --verilator --xilinx --spartan6 --flatten --noattr_netlist -h"
 
     # If the current word starts with a dash, complete options.
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
         return 0
     fi
-
-    # Define verbosity levels when completing -verbosity
-    if [[ "$prev" == "--verbosity" ]]; then
-        COMPREPLY=( $(compgen -W "UVM_HIGH UVM_MEDIUM UVM_LOW UVM_NONE" -- "$cur") )
-        return 0
-    fi
-
-    # Simulator choices when completing --simulator
-    if [[ "$prev" == "--simulator" ]]; then
-        COMPREPLY=( $(compgen -W "modelsim vcs" -- "$cur") )
-        return 0
-    fi
-
+    
     # If the previous word was "--block", complete block names.
     if [[ "$prev" == "--block" ]]; then
         # Locate the git repository top.
-        local verif_dir="$repo_top/verif"
+        local verif_dir="$repo_top/design"
         # If the "verif" directory exists, list its subdirectories.
         if [[ -d "$verif_dir" ]]; then
             local blocks
@@ -47,7 +35,7 @@ _test_runner_completion() {
     fi
 
     # If the previous word was "--test", complete test names.
-    if [[ "$prev" == "--test" ]]; then
+    if [[ "$prev" == "--top" ]]; then
         # First, find the block value given in the command line.
         local block=""
         local i
@@ -60,11 +48,11 @@ _test_runner_completion() {
 
         # If no block is specified, there's nothing to complete.
         [[ -z "$block" ]] && return 0
+        
+	local modules
+        modules=$(find "$repo_top/design/${block}/src" -type f -printf '%f\n' 2>/dev/null)
+	COMPREPLY=( $(compgen -W "$modules" -- "$cur") )
 
-        # Call your helper script (or function) that returns the tests for a block.
-        local tests
-        tests=$(python3 $repo_top/bin/runners/shell_utils/get_tests.py "$block")
-        COMPREPLY=( $(compgen -W "$tests" -- "$cur") )
         return 0
     fi
 
@@ -74,5 +62,5 @@ _test_runner_completion() {
 }
 
 
-complete -F _test_runner_completion test_runner
+complete -F _synth_runner_completion synth_runner
 
