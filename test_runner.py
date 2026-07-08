@@ -281,14 +281,16 @@ def parse_test_args(block, test):
     block_dir = f"{wa_root}/verif/{block}"
     tests_config = f"{block_dir}/lib/tests.yaml"
     print_message("info", f"Parsing Tests config YAML - {tests_config}")
-    content = load_yaml(tests_config)
+    content = load_yaml(tests_config) or {}
 
-    test_context = next((t for t in content.get('tests', []) if t['name'] == test), None)
+    # `tests:` / `compilations:` present-but-empty parse to None, so the ' or []'
+    # is required: `.get(key, [])` only defaults a MISSING key, not a null one.
+    test_context = next((t for t in (content.get('tests') or []) if t['name'] == test), None)
     if not test_context:
         print_message("error", f"Test '{test}' not found in {tests_config}")
         exit(1)
 
-    comp_context = next((c for c in content.get('compilations', []) if c['name'] == test_context['comp']), None)
+    comp_context = next((c for c in (content.get('compilations') or []) if c['name'] == test_context['comp']), None)
     if not comp_context:
         print_message("error", f"Compilation '{test_context['comp']}' not found for test '{test}'")
         exit(1)
