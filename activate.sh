@@ -15,9 +15,10 @@ _vr_runner() {                      # $1 = runner basename, rest = its args
     [[ -f "$r" ]] || { echo "vlsi-runners: no $rn.py under $root/bin" >&2; return 1; }
     python3 -B "$r" "$@"
 }
-test_runner()  { _vr_runner test_runner  "$@"; }
-regr_runner()  { _vr_runner regr_runner  "$@"; }
-synth_runner() { _vr_runner synth_runner "$@"; }
+test_runner()   { _vr_runner test_runner   "$@"; }
+regr_runner()   { _vr_runner regr_runner   "$@"; }
+synth_runner()  { _vr_runner synth_runner  "$@"; }
+metric_runner() { _vr_runner metric_runner "$@"; }
 
 # register tab-completion (sourced once; the completion functions self-locate per repo)
 _vr_su="$(cd "$(dirname "${BASH_SOURCE[0]}")/shell_utils" 2>/dev/null && pwd)"
