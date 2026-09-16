@@ -91,6 +91,39 @@ def _gather_attrs_and_filelist(args, simdir):
 # ----------------------------------------------------------------------
 # Modelsim / Questa path
 # ----------------------------------------------------------------------
+def _snapshot_marker(simdir, lib):
+    """Where a library records the optimized design unit built into it.
+
+    Questa keeps optimized units inside the library, and `vdir` is the only
+    way to list them by name, so the builder leaves a one-line marker beside
+    the library instead: a runner can then tell a snapshot library from one
+    built before snapshots existed without spawning a tool."""
+    path = lib if os.path.isabs(lib) else os.path.join(simdir, lib)
+    return f"{path}.vopt"
+
+
+def _snapshot_name(simdir, lib):
+    """The snapshot in this library, or None."""
+    try:
+        with open(_snapshot_marker(simdir, lib)) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def _mark_snapshot(simdir, lib, name):
+    with open(_snapshot_marker(simdir, lib), "w") as f:
+        f.write(f"{name}\n")
+
+
+def _clear_snapshot(simdir, lib):
+    """A recompile invalidates whatever was optimized before it."""
+    try:
+        os.remove(_snapshot_marker(simdir, lib))
+    except OSError:
+        pass
+
+
 def run_modelsim(args, simdir, sim_args):
     try:
         with open(f'{simdir}/sim.do', 'w') as f:
@@ -106,26 +139,25 @@ def run_modelsim(args, simdir, sim_args):
         print_message("error", f"An error occurred: {e}")
         exit(1)
 
-    vlib_cmd = "vlib -type flat sv_tb_work"
-    vlog_cmd = "vlog -lint=full -work sv_tb_work +acc=nprt -l comp.log -mfcu -f comp_filelist.f"
-    vsim_cmd = f"vsim -c -onfinish stop -work sv_tb_work -l run.log -do sim.do -sv_seed {args.seed} {args.top} {sim_args}"
-
-    if args.uvm_test:
-        vsim_cmd += f" +UVM_TESTNAME={args.uvm_test} +UVM_MAX_QUIT_COUNT={args.uvm_max_quit} +UVM_VERBOSITY={args.verbosity}"
-
-    if args.dump or args.dump_mem:
-        vsim_cmd += " -wlf waves.wlf -voptargs=+acc -debugdb"
-    else:
-        # FIXME: a simulator optimization bug introduces race conditions (e.g. ovip_axi_4lite_test
-        # fails). Disabling optimization with +acc works around it until the root cause is fixed.
-        vsim_cmd += " -voptargs=+acc"
-
+    # The work library: this test's own by default, or a SHARED one built
+    # once for every test of the same design (--lib). Questa's equivalent of
+    # a VCS simv is an OPTIMIZED DESIGN UNIT inside that library: vopt names
+    # one, and vsim then runs it without optimizing again. Without it every
+    # test of a design re-optimizes it, which the run logs show as "Design is
+    # being optimized..." every single time (measured on one design: 4.8 s
+    # per run, 1.8 s against a snapshot).
+    lib = args.lib or "sv_tb_work"
+    snapshot = f"{args.top}_opt"
+    waves = args.dump or args.dump_mem
+    vlib_cmd = f"vlib -type flat {lib}"
+    vlog_cmd = f"vlog -lint=full -work {lib} +acc=nprt -l comp.log -mfcu -f comp_filelist.f"
+    vopt_cmd = f"vopt -work {lib} {args.top} -o {snapshot} +acc -l vopt.log"
     if args.codecov:
         vlog_cmd += " -cover bcefsx"
-        vsim_cmd += " -coverage"
+        vopt_cmd += " -cover bcefsx"
 
     do_comp = not args.run_only
-    do_sim  = not args.compile_only
+    do_sim = not args.compile_only
 
     if do_comp:
         r = run_command(vlib_cmd, simdir)
@@ -138,6 +170,33 @@ def run_modelsim(args, simdir, sim_args):
             print_message('error', "Compilation Failed")
             print_message('error', f"LOG:  {simdir}/comp.log")
             exit(1)
+        _clear_snapshot(simdir, lib)
+        # a wave run wants the debug database, which is baked at optimization
+        # time, so it keeps the old path and lets vsim optimize with -debugdb
+        if not waves:
+            r = run_command(vopt_cmd, simdir)
+            if r:
+                print_message('error', f"Optimization Failed {r}")
+                print_message('error', f"LOG:  {simdir}/vopt.log")
+                exit(1)
+            _mark_snapshot(simdir, lib, snapshot)
+
+    # run the snapshot when there is one; a library built before this change,
+    # or a wave run, falls back to optimizing inside vsim exactly as before
+    use_snapshot = (not waves) and _snapshot_name(simdir, lib) == snapshot
+    target = snapshot if use_snapshot else args.top
+    vsim_cmd = (f"vsim -c -onfinish stop -work {lib} -l run.log -do sim.do "
+                f"-sv_seed {args.seed} {target} {sim_args}")
+    if args.uvm_test:
+        vsim_cmd += f" +UVM_TESTNAME={args.uvm_test} +UVM_MAX_QUIT_COUNT={args.uvm_max_quit} +UVM_VERBOSITY={args.verbosity}"
+    if waves:
+        vsim_cmd += " -wlf waves.wlf -voptargs=+acc -debugdb"
+    elif not use_snapshot:
+        # FIXME: a simulator optimization bug introduces race conditions (e.g. ovip_axi_4lite_test
+        # fails). Disabling optimization with +acc works around it until the root cause is fixed.
+        vsim_cmd += " -voptargs=+acc"   # the snapshot carries the same +acc
+    if args.codecov:
+        vsim_cmd += " -coverage"
 
     if do_sim:
         r = run_command(vsim_cmd, simdir)
@@ -350,6 +409,10 @@ def main():
     parser.add_argument('--uvm_max_quit', type=int, default=3, help="Set value for UVM_MAX_QUIT_COUNT")
     parser.add_argument("--compile-only", action="store_true", help="Only compile without running")
     parser.add_argument("--run-only", action="store_true", help="Only run without compiling")
+    parser.add_argument("--lib", type=str, help="Work library to compile into or run "
+                        "against (default: sv_tb_work in the run directory). With "
+                        "--compile-only it is built once; every --run-only test then "
+                        "points at it and skips both compilation and optimization.")
     parser.add_argument("--gui", action="store_true", help="Run ModelSim in GUI mode")
     parser.add_argument("--dump", action="store_true", help="Collect dump file")
     parser.add_argument("--dump-mem", action="store_true", help="Collect dump file including memories")

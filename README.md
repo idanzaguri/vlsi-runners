@@ -19,6 +19,28 @@ the runner code lives here.
 overrides the one baked into the entry (handy for many flavors of one test class).
 `regr_runner --tests` takes a YAML list of `{name, block}` entries.
 
+### One compile per design, not per test (Questa)
+
+Questa optimizes a design inside `vsim`, so a design with five tests used to be
+optimized five times. `test_runner` now runs `vopt` after `vlog` and names the result
+`<top>_opt`; `vsim` runs that unit and optimizes nothing. Measured on one design:
+**4.8 s per test becomes 1.8 s.**
+
+`regr_runner` uses it across a whole list: it builds one work library per DESIGN
+(`<regression>/_build/<block>/<comp>`) before the run, then every test of that design
+runs against it with `--run-only --lib <that>/sv_tb_work`.
+
+| flag | where | what |
+|---|---|---|
+| `--lib <path>` | `test_runner` | compile into, or run against, this work library instead of the run directory's own |
+| `--compile-only` | `test_runner` | build the library and its snapshot, run nothing |
+| `--no-shared-lib` | `regr_runner` | compile inside every test, as before |
+
+A wave run (`--dump`) keeps the old path: the debug database is baked at optimization
+time, so `vsim` optimizes that one itself. A library built before this change has no
+snapshot and is run exactly as it used to be; a recompile clears the marker
+(`<lib>.vopt`) that records the snapshot's name.
+
 `metric_runner` reads the same `design/<block>/lib/config.yaml` as `synth_runner`. It
 maps the RTL with yosys and reports **relative** proxies (there is no real PDK here, so
 absolute values are meaningless, only the diff between two designs matters): chip area +

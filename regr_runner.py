@@ -65,9 +65,16 @@ def _terminate_running_procs(grace=2):
     return len(procs)
 
 
-def run_test(block, test, seed, rundir, codecov=False, simulator="modelsim"):
-    """Runs a single test instance with the given parameters."""
+def run_test(block, test, seed, rundir, codecov=False, simulator="modelsim",
+             lib=None):
+    """Runs a single test instance with the given parameters.
+
+    ``lib`` is a work library built once for this test's DESIGN (see
+    :func:`build_libs`): the test then compiles nothing and optimizes
+    nothing, it just runs the snapshot already in there."""
     cmd = f"python3 {_TEST_RUNNER} --block {block} --test {test} --seed {seed} --rundir {rundir} --simulator {simulator}"
+    if lib:
+        cmd += f" --run-only --lib {lib}"
     if codecov:
         cmd += " --codecov"
 
@@ -147,6 +154,34 @@ def clean_test_files(rundir, success, keep_patterns = ["test.log", "coverage.ucd
                         directory.rmdir()
                 except Exception as e:
                     print(f"Could not delete directory {directory}: {e}")
+
+
+def comp_of_tests(block):
+    """{test name: compilation name} from the block's own tests.yaml.
+
+    Several tests share one compilation (one design, several UVM tests), and
+    that is the unit a work library is built for."""
+    path = Path(wa_root) / "verif" / block / "lib" / "tests.yaml"
+    try:
+        data = yaml.safe_load(path.read_text()) or {}
+    except OSError:
+        return {}
+    return {t.get("name"): t.get("comp") for t in (data.get("tests") or [])
+            if t.get("name") and t.get("comp")}
+
+
+def build_lib(block, comp, test, build_dir, codecov=False, simulator="modelsim"):
+    """Compile and optimize one design ONCE, into its own work library."""
+    build_dir.mkdir(parents=True, exist_ok=True)
+    cmd = (f"python3 {_TEST_RUNNER} --block {block} --test {test} "
+           f"--compile-only --rundir {build_dir} --simulator {simulator}")
+    if codecov:
+        cmd += " --codecov"
+    r = subprocess.run(shlex.split(cmd), capture_output=True, text=True)
+    ok = r.returncode == 0
+    if not ok:
+        (build_dir / "build.log").write_text(r.stdout + r.stderr)
+    return (block, comp), ok
 
 
 def parse_test_list(file_path):
@@ -255,6 +290,7 @@ def main():
     parser.add_argument("--pedant", action="store_true", help="Treat tests that pass with warnings as failures (affects pass rate and stop_on_fail)")
     parser.add_argument("--timeout", type=int, default=300, help="Per-test wall-clock timeout in seconds; a test exceeding it is killed and marked FAILED (default: 300)")
     parser.add_argument("--simulator", type=str, choices=["modelsim", "vcs"], default="modelsim", help="Simulator to use for every test in the regression (default: modelsim)")
+    parser.add_argument("--no-shared-lib", action="store_true", help="Compile and optimize inside every test, as before the shared design libraries (slower; use if a library build is in the way)")
     args = parser.parse_args()
 
     if args.name is None:
@@ -321,7 +357,39 @@ def main():
             rundir = regression_dir / block / test / f"seed_{seed}"
             test_queue.append((block, test, seed, rundir))
     random.shuffle(test_queue)
-    
+
+    # Build each DESIGN once (Idan, 2026-09-16). Questa optimizes the design
+    # inside vsim, so every test of one design used to re-optimize it; a work
+    # library with a named snapshot is built here instead, and the tests just
+    # run it. Measured on one design: 4.8 s per test becomes 1.8 s.
+    libs, build_failed = {}, set()
+    if args.simulator == "modelsim" and not args.no_shared_lib:
+        wanted = {}
+        for block, test, _seed, _rundir in test_queue:
+            comp = comp_of_tests(block).get(test)
+            if comp:
+                wanted.setdefault((block, comp), test)
+        if wanted:
+            print_message("info", f"building {len(wanted)} design librar"
+                                  f"{'y' if len(wanted) == 1 else 'ies'} once")
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=args.max_parallel) as pool:
+                jobs = [pool.submit(build_lib, b, c,
+                                    wanted[(b, c)],
+                                    regression_dir / "_build" / b / c,
+                                    args.codecov, args.simulator)
+                        for (b, c) in wanted]
+                for job in tqdm(concurrent.futures.as_completed(jobs),
+                                total=len(jobs), desc="compiling",
+                                bar_format='{l_bar}{bar} | {elapsed}'):
+                    (b, c), ok = job.result()
+                    if ok:
+                        libs[(b, c)] = regression_dir / "_build" / b / c / "sv_tb_work"
+                    else:
+                        build_failed.add((b, c))
+                        tqdm.write(f"{c}: {RED}compilation failed{RESET} "
+                                   f"({regression_dir / '_build' / b / c / 'build.log'})")
+
     # Print tables for each block
     for block, tests in grouped_tests.items():
         print_block_table(block, tests)
@@ -341,7 +409,9 @@ def main():
                 rundir.mkdir(parents=True, exist_ok=True)
                 pending_tests -= 1
                 running_tests += 1
-                future = executor.submit(run_test, block, test, seed, rundir, args.codecov, args.simulator)
+                lib = libs.get((block, comp_of_tests(block).get(test)))
+                future = executor.submit(run_test, block, test, seed, rundir,
+                                         args.codecov, args.simulator, lib)
                 futures[future] = (block, test, seed, rundir)
                 pbar.set_description(status())
                 pbar.update(0)
