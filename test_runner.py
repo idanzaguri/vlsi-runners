@@ -200,6 +200,15 @@ def run_modelsim(args, simdir, sim_args):
 
     if do_sim:
         expect = getattr(args, "expect_fail", None)
+        if expect:
+            # an expect_fail test reads the log to decide, so a log left by an
+            # EARLIER run would answer for a simulation that never happened:
+            # vsim missing, a refused license, any launch failure. Remove it
+            # first, so "no log" can never look like "the guard fired".
+            try:
+                os.remove(f"{simdir}/run.log")
+            except OSError:
+                pass
         r = run_command(vsim_cmd, simdir)
         if r and not expect:
             print_message('error', f"Simulation Failed {r}")
@@ -218,7 +227,10 @@ def run_modelsim(args, simdir, sim_args):
             try:
                 log_text = open(f"{simdir}/run.log", errors="ignore").read()
             except OSError:
-                log_text = ""
+                print_message('error',
+                              "the simulation left no log, so there is nothing "
+                              "to check the expected failure against")
+                exit(1)
             fired = expect in log_text
             failed = bool(r) or status in ("FAILED", "UNKNOWN")
             if fired and failed:
