@@ -199,8 +199,9 @@ def run_modelsim(args, simdir, sim_args):
         vsim_cmd += " -coverage"
 
     if do_sim:
+        expect = getattr(args, "expect_fail", None)
         r = run_command(vsim_cmd, simdir)
-        if r:
+        if r and not expect:
             print_message('error', f"Simulation Failed {r}")
             exit(1)
         status = parse_log(f"{simdir}/run.log", ms_sim_passed, ms_sim_warn, ms_sim_fail, ms_sim_waive, True, True)
@@ -208,6 +209,31 @@ def run_modelsim(args, simdir, sim_args):
         print(f"LOG:  {simdir}/run.log")
         if args.dump or args.dump_mem:
             print(f"DUMP: {simdir}/waves.wlf")
+        if expect:
+            # an EXPECTED failure (open item 50): this test exists to make a
+            # guard fire, so the run failing is the pass condition. Both
+            # halves are required, or a guard that stopped firing would read
+            # as green: the run must have failed, and the log must carry the
+            # guard's own words.
+            try:
+                log_text = open(f"{simdir}/run.log", errors="ignore").read()
+            except OSError:
+                log_text = ""
+            fired = expect in log_text
+            failed = bool(r) or status in ("FAILED", "UNKNOWN")
+            if fired and failed:
+                print_message('info', f"expected failure seen: {expect}")
+                exit(0)
+            if not fired:
+                print_message('error',
+                              f"the guard did not fire: nothing in the log "
+                              f"matched {expect!r}")
+            else:
+                print_message('error',
+                              "the guard's text is in the log but the run "
+                              "passed; the runner no longer treats it as a "
+                              "failure")
+            exit(1)
         if r or status in ("FAILED", "UNKNOWN"):
             exit(1)
         if status == "PASSED_WARN":
@@ -381,6 +407,27 @@ def parse_test_args(block, test):
 
 
 
+def test_expectation(block, test):
+    """The ``expect_fail`` string a test declares in tests.yaml, or None.
+
+    A handful of the generated guards are `$error` assertions rather than a
+    DECERR answer: an access wider than the slave, a WRAP or FIXED re-issue
+    past AXI's 16, a length re-issue past 256, and a violated
+    ``burst_overflow: guaranteed``. Those are live gates, and a test that
+    drives one makes the run FAIL, which is correct. Without a way to say
+    "this one was supposed to", they could only ever be checked at the
+    generator and never in simulation (open item 50).
+
+    A test that declares ``expect_fail`` inverts its verdict: it passes only
+    when the run failed AND the log carries that text, so a guard that stops
+    firing is a failure rather than a quieter green.
+    """
+    block_dir = f"{wa_root}/verif/{block}"
+    content = load_yaml(f"{block_dir}/lib/tests.yaml") or {}
+    ctx = next((x for x in (content.get('tests') or []) if x['name'] == test), None)
+    return (ctx or {}).get('expect_fail')
+
+
 def main():
     global wa_root
     wa_root = get_git_root()
@@ -423,7 +470,9 @@ def main():
     original_args = sys.argv[1:]
     args = parser.parse_args()
 
+    expect_fail = None
     if args.test:
+        expect_fail = test_expectation(args.block, args.test)
         additional_args = parse_test_args(args.block, args.test)
         # A CLI --uvm_test overrides the one baked into tests.yaml (yaml args are
         # appended last and would otherwise win), so a custom test can run against an
@@ -437,6 +486,10 @@ def main():
         except SystemExit:
             print_message("error",f"Additional arguments from tests.yaml failed. check error message above")
             exit(1)
+
+    # AFTER the re-parse above, which builds a fresh namespace and would drop
+    # anything set on the old one (open item 50)
+    args.expect_fail = expect_fail
 
     if args.dut is None:
         args.dut = args.top
