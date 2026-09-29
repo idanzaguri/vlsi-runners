@@ -84,9 +84,10 @@ def run_test(block, test, seed, rundir, codecov=False, simulator="modelsim",
     # interrupt handler has already swept _running_procs.
     # start_new_session=True puts this test (and its vlog/vsim children) in its own
     # process group so the Ctrl-C handler can kill the whole tree via os.killpg.
+    t_start = time.time()
     with _running_procs_lock:
         if _abort_event.is_set():
-            return block, test, seed, "FAILED"
+            return block, test, seed, "FAILED", 0.0
         proc = subprocess.Popen(cmd_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, start_new_session=True)
         _running_procs[proc.pid] = proc
@@ -127,7 +128,7 @@ def run_test(block, test, seed, rundir, codecov=False, simulator="modelsim",
         status = "PASSED_WARN"
     else:
         status = "FAILED"
-    return block, test, seed, status
+    return block, test, seed, status, time.time() - t_start
 
 
 def clean_test_files(rundir, success, keep_patterns = ["test.log", "coverage.ucdb"]):
@@ -156,18 +157,28 @@ def clean_test_files(rundir, success, keep_patterns = ["test.log", "coverage.ucd
                     print(f"Could not delete directory {directory}: {e}")
 
 
+_comp_cache = {}
+
+
 def comp_of_tests(block):
     """{test name: compilation name} from the block's own tests.yaml.
 
     Several tests share one compilation (one design, several UVM tests), and
-    that is the unit a work library is built for."""
+    that is the unit a work library is built for. Parsed once per block: the
+    file is 200 KB, the parse 0.4 s, and a 780-member list asked for it
+    twice per member on the main thread (10 minutes of a 25-minute run)."""
+    if block in _comp_cache:
+        return _comp_cache[block]
     path = Path(wa_root) / "verif" / block / "lib" / "tests.yaml"
     try:
-        data = yaml.safe_load(path.read_text()) or {}
+        loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+        data = yaml.load(path.read_text(), Loader=loader) or {}
     except OSError:
         return {}
-    return {t.get("name"): t.get("comp") for t in (data.get("tests") or [])
-            if t.get("name") and t.get("comp")}
+    _comp_cache[block] = {t.get("name"): t.get("comp")
+                          for t in (data.get("tests") or [])
+                          if t.get("name") and t.get("comp")}
+    return _comp_cache[block]
 
 
 def build_lib(block, comp, test, build_dir, codecov=False, simulator="modelsim"):
@@ -207,9 +218,15 @@ def parse_test_list(file_path):
 
 def summarize_results(results, summary_path, total_tests, start_time, pedant=False):
     """Generates a summary of all test results."""
-    passed      = [f"{t[1]} (seed {t[2]}) {t[4]}" for t in results if t[3] == "PASSED"]
-    passed_warn = [f"{t[1]} (seed {t[2]}) {t[4]}" for t in results if t[3] == "PASSED_WARN"]
-    failed      = [f"{t[1]} (seed {t[2]}) {t[4]}" for t in results if t[3] == "FAILED"]
+    def line(t):
+        # test, seed, log, and the member's wall time (compile is per design,
+        # so this is the vsim run plus the runner's own overhead)
+        secs = t[5] if len(t) > 5 else 0.0
+        return f"{t[1]} (seed {t[2]}) {secs:6.1f}s {t[4]}"
+    passed      = [line(t) for t in results if t[3] == "PASSED"]
+    passed_warn = [line(t) for t in results if t[3] == "PASSED_WARN"]
+    failed      = [line(t) for t in results if t[3] == "FAILED"]
+    slowest = sorted(results, key=lambda t: -(t[5] if len(t) > 5 else 0.0))[:10]
     duration = time.time() - start_time
 
     effective_passed = len(passed) + (0 if pedant else len(passed_warn))
@@ -227,6 +244,8 @@ def summarize_results(results, summary_path, total_tests, start_time, pedant=Fal
         f"Effective pass rate: {effective_passed/total_tests:.1%}\n"
         f"Duration: {duration:.2f} seconds\n"
         f"{'='*40}\n"
+        f"Slowest members:\n" + "\n".join(line(t) for t in slowest) + "\n"
+        f"{'-'*40}\n"
         f"Passed Tests:\n" + "\n".join(passed) + "\n"
         f"{'-'*40}\n"
         f"Passed with Warnings:\n" + "\n".join(passed_warn) + "\n"
@@ -422,9 +441,9 @@ def main():
             
             for future in done:
                 block, test, seed, rundir = futures.pop(future)
-                test_status = future.result()[3]
+                test_status, elapsed = future.result()[3:5]
                 test_log = rundir / "test.log"
-                results.append((block, test, seed, test_status, test_log))
+                results.append((block, test, seed, test_status, test_log, elapsed))
                 if not args.keep:
                     clean_test_files(rundir, test_status != "FAILED")
                 running_tests -= 1
