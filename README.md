@@ -41,6 +41,31 @@ time, so `vsim` optimizes that one itself. A library built before this change ha
 snapshot and is run exactly as it used to be; a recompile clears the marker
 (`<lib>.vopt`) that records the snapshot's name.
 
+### Code coverage (Questa)
+
+`--codecov` on either runner collects code coverage: statement, branch, condition,
+expression, FSM and toggle. **It works on the free Questa FPGA Starter Edition**
+(checked on FSE 2025.2): every type above, assertion counts, `coverage save`,
+`vcover merge` and `vcover report`, text and HTML. What the Starter Edition refuses
+is the `svverification` license feature, so covergroups, `randomize()`, `randcase`
+and `randsequence` fail at load time; functional coverage has to wait for a full
+license. (The HTML report also warns that test-plan data needs a `qvman` license;
+there is none to include, so ignore it.)
+
+Only the **design's RTL** is instrumented: the units whose source file belongs to a
+`design` block in the dependency tree, selected by name with `vopt +cover=bcefsx+<unit>`
+(the library's `vdir -l` says which unit came from which file). A plain `-cover` would
+instrument the bench and the VIPs too, and the report drowns in VIP toggles nobody will
+close. A block tree without a `design` block, such as a VIP's own bench, covers everything.
+
+| run | what you get |
+|---|---|
+| `test_runner ... --codecov` | the totals table on the console, `coverage.txt` and `coverage.ucdb` in the run directory (`coverage save -instance <--dut>`) |
+| `regr_runner ... --codecov` | per block: `merged.ucdb`, `coverage.txt` (also appended to `summary.txt`) and `coverage_html/index.html` under `sim/regression/<name>/<block>/` |
+
+To browse a database in the GUI: `vsim -viewcov <file>.ucdb`. To exclude something
+from the figures, `vcover` and the GUI's exclusion commands apply to the merged file.
+
 `metric_runner` reads the same `design/<block>/lib/config.yaml` as `synth_runner`. It
 maps the RTL with yosys and reports **relative** proxies (there is no real PDK here, so
 absolute values are meaningless, only the diff between two designs matters): chip area +

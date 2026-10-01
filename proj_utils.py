@@ -152,7 +152,12 @@ def get_block_yaml_path(block_type, block_name):
     return block_path
 
 def resolve_dependencies(block_name, block_type, jinja2_variables=None, visited=None):
-    """Recursively resolve dependencies for a given block."""
+    """Recursively resolve dependencies for a given block.
+
+    Each block's config comes back tagged with the block type it was found
+    under (``_block_type``: "design", "verif", ...), so a caller can tell the
+    design's RTL from the bench that drives it: code coverage instruments
+    the former and leaves the latter alone."""
     if visited is None:
         visited = set()
     
@@ -181,12 +186,18 @@ def resolve_dependencies(block_name, block_type, jinja2_variables=None, visited=
         for dep in dep_list:
             dependencies.extend(resolve_dependencies(dep, dep_type, jinja2_variables, visited))
 
+    content["_block_type"] = block_type
     dependencies.append(content)  # Append current block after resolving deps
     return dependencies
 
 
-def parse_attributes(block_name, block_type="verif", attributes = ["include_dirs", "defines", "files", "comp_args", "sim_args"], jinja2_variables = {}):
-    """Builds compilation and simulation commands from the YAML dependencies.""" 
+def parse_attributes(block_name, block_type="verif", attributes = ["include_dirs", "defines", "files", "comp_args", "sim_args"], jinja2_variables = {}, with_blocks=False):
+    """Builds compilation and simulation commands from the YAML dependencies.
+
+    With ``with_blocks`` the resolved block configs come back as well, in
+    dependency order and tagged with their block type (see
+    :func:`resolve_dependencies`), for a caller that needs to know WHICH
+    block a file came from and not only the merged lists."""
     dependencies = resolve_dependencies(block_name, block_type, jinja2_variables)
     
     parsed_attributes = {key: [] for key in attributes}
@@ -201,6 +212,8 @@ def parse_attributes(block_name, block_type="verif", attributes = ["include_dirs
             assert isinstance(value, list), f"{attrib} must be a list"
             parsed_attributes[attrib].extend(value)
     
+    if with_blocks:
+        return parsed_attributes, dependencies
     return parsed_attributes
 
 

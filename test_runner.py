@@ -68,7 +68,14 @@ def _gather_attrs_and_filelist(args, simdir):
         **os.environ,
     }
     attributes_to_parse = ["include_dirs", "defines", "files", "comp_args", "sim_args"]
-    attributes = parse_attributes(args.block, "verif", attributes_to_parse, jinja2_variables)
+    attributes, blocks = parse_attributes(args.block, "verif", attributes_to_parse,
+                                          jinja2_variables, with_blocks=True)
+    # the RTL under test: every file of every `design` block in the tree.
+    # Code coverage is collected on these and on nothing else (the bench,
+    # the VIPs and UVM are not what coverage closure is about).
+    design_files = frozenset(os.path.realpath(f)
+                             for b in blocks if b.get("_block_type") == "design"
+                             for f in (b.get("files") or []))
 
     data = []
     if args.comp_args:
@@ -85,7 +92,7 @@ def _gather_attrs_and_filelist(args, simdir):
     if args.sim_args:
         sim_args.extend([w for sub in args.sim_args for item in sub for w in item.split()])
     sim_args.extend(attributes["sim_args"])
-    return " ".join(sim_args)
+    return " ".join(sim_args), design_files
 
 
 # ----------------------------------------------------------------------
@@ -124,7 +131,73 @@ def _clear_snapshot(simdir, lib):
         pass
 
 
-def run_modelsim(args, simdir, sim_args):
+# Code coverage types: branch, condition, expression, FSM, statement and
+# extended toggle. Collected by the Starter Edition too (checked on Questa
+# FSE 2025.2: every type below, assertions, `coverage save`, `vcover merge`
+# and `vcover report` all work; only covergroups and randomize() are refused,
+# by the missing `svverification` license feature).
+COVER_TYPES = "bcefsx"
+
+
+def _design_units(simdir, lib, design_files):
+    """The compiled modules, interfaces and entities whose source is one
+    of ``design_files``.
+
+    The library is the only place that knows which unit came from which
+    file: `vdir -l` lists every unit with a `Source file:` line."""
+    lib_path = lib if os.path.isabs(lib) else os.path.join(simdir, lib)
+    r = subprocess.run(["vdir", "-l", "-lib", lib_path], cwd=simdir,
+                       capture_output=True, text=True)
+    if r.returncode:
+        return []
+    units, name = [], None
+    for line in r.stdout.splitlines():
+        if line and not line[0].isspace():
+            # a unit header: "MODULE foo", "INTERFACE bar", "ENTITY baz",
+            # "Verilog PACKAGE p", "OPTIMIZED DESIGN tb_opt"
+            words = line.split()
+            name = words[-1] if words[0] in ("MODULE", "INTERFACE", "ENTITY") else None
+        elif name and line.strip().startswith("Source file:"):
+            if os.path.realpath(line.split(":", 1)[1].strip()) in design_files:
+                units.append(name)
+            name = None
+    return units
+
+
+def _coverage_opts(simdir, lib, design_files):
+    """The optimizer switches that instrument the design under test, and
+    only it.
+
+    A plain ``-cover`` instruments every unit in the library: the UVM bench,
+    the VIP interfaces, everything. The report is then dominated by VIP
+    toggles nobody will ever close (measured on one bench: eight agent
+    interfaces, 25 000 toggle bins at under 10%, before a single line of
+    the design). So the units whose source sits in a `design` block are
+    selected by name, and the bench is left alone, which also keeps it at
+    full speed. A tree without a design block (a VIP's own bench) covers
+    everything, as before."""
+    units = _design_units(simdir, lib, design_files) if design_files else []
+    if design_files and not units:
+        print_message("warning", "no compiled unit matched a design file, "
+                                 "so the whole bench is covered")
+    if not units:
+        return f"-cover {COVER_TYPES}"
+    return " ".join(f"+cover={COVER_TYPES}+{u}" for u in units)
+
+
+def _print_coverage(simdir):
+    """The totals table the simulation wrote, and where the database is."""
+    try:
+        with open(f"{simdir}/coverage.txt") as f:
+            table = [line.rstrip() for line in f if line.strip()]
+    except OSError:
+        print_message("warning", "the simulation saved no coverage summary")
+        return
+    print("\n".join(table))
+    print(f"COV:  {simdir}/coverage.ucdb")
+
+
+def run_modelsim(args, simdir, sim_args, design_files=frozenset()):
     try:
         with open(f'{simdir}/sim.do', 'w') as f:
             if args.dump_mem:
@@ -133,6 +206,9 @@ def run_modelsim(args, simdir, sim_args):
                 f.write(f"log -r {args.dut}/*;\n")
             f.write("run -all;\n")
             if args.codecov:
+                # the totals for the console, then the database for merging;
+                # -instance keeps the saved tree under --dut
+                f.write("coverage report -summary -output coverage.txt;\n")
                 f.write(f"coverage save -testname {args.test}_{args.seed} -instance {args.dut} coverage.ucdb;\n")
             f.write("quit;\n")
     except Exception as e:
@@ -152,9 +228,9 @@ def run_modelsim(args, simdir, sim_args):
     vlib_cmd = f"vlib -type flat {lib}"
     vlog_cmd = f"vlog -lint=full -work {lib} +acc=nprt -l comp.log -mfcu -f comp_filelist.f"
     vopt_cmd = f"vopt -work {lib} {args.top} -o {snapshot} +acc -l vopt.log"
-    if args.codecov:
-        vlog_cmd += " -cover bcefsx"
-        vopt_cmd += " -cover bcefsx"
+    # coverage is an OPTIMIZER choice, not a compiler one: `vopt +cover` on
+    # units compiled without -cover instruments them just the same, and the
+    # units are picked after vlog, when the library can list them
 
     do_comp = not args.run_only
     do_sim = not args.compile_only
@@ -174,6 +250,8 @@ def run_modelsim(args, simdir, sim_args):
         # a wave run wants the debug database, which is baked at optimization
         # time, so it keeps the old path and lets vsim optimize with -debugdb
         if not waves:
+            if args.codecov:
+                vopt_cmd += " " + _coverage_opts(simdir, lib, design_files)
             r = run_command(vopt_cmd, simdir)
             if r:
                 print_message('error', f"Optimization Failed {r}")
@@ -190,7 +268,10 @@ def run_modelsim(args, simdir, sim_args):
     if args.uvm_test:
         vsim_cmd += f" +UVM_TESTNAME={args.uvm_test} +UVM_MAX_QUIT_COUNT={args.uvm_max_quit} +UVM_VERBOSITY={args.verbosity}"
     if waves:
-        vsim_cmd += " -wlf waves.wlf -voptargs=+acc -debugdb"
+        voptargs = "+acc"
+        if args.codecov:
+            voptargs += " " + _coverage_opts(simdir, lib, design_files)
+        vsim_cmd += f' -wlf waves.wlf -voptargs="{voptargs}" -debugdb'
     elif not use_snapshot:
         # FIXME: a simulator optimization bug introduces race conditions (e.g. ovip_axi_4lite_test
         # fails). Disabling optimization with +acc works around it until the root cause is fixed.
@@ -199,6 +280,14 @@ def run_modelsim(args, simdir, sim_args):
         vsim_cmd += " -coverage"
 
     if do_sim:
+        if args.codecov:
+            # like the log below: a database left by an earlier run must
+            # not answer for this one
+            for stale in ("coverage.txt", "coverage.ucdb"):
+                try:
+                    os.remove(f"{simdir}/{stale}")
+                except OSError:
+                    pass
         expect = getattr(args, "expect_fail", None)
         if expect:
             # an expect_fail test reads the log to decide, so a log left by an
@@ -218,6 +307,8 @@ def run_modelsim(args, simdir, sim_args):
         print(f"LOG:  {simdir}/run.log")
         if args.dump or args.dump_mem:
             print(f"DUMP: {simdir}/waves.wlf")
+        if args.codecov:
+            _print_coverage(simdir)
         if expect:
             # an EXPECTED failure (open item 50): this test exists to make a
             # guard fire, so the run failing is the pass condition. Both
@@ -366,12 +457,12 @@ def generate_sim_command(args):
         shutil.rmtree(simdir, ignore_errors=True)
     os.makedirs(simdir, exist_ok=True)
 
-    sim_args = _gather_attrs_and_filelist(args, simdir)
+    sim_args, design_files = _gather_attrs_and_filelist(args, simdir)
 
     if args.simulator == "vcs":
         run_vcs(args, simdir, sim_args)
     else:
-        run_modelsim(args, simdir, sim_args)
+        run_modelsim(args, simdir, sim_args, design_files)
 
 
 def parse_test_args(block, test):
@@ -475,7 +566,9 @@ def main():
     parser.add_argument("--gui", action="store_true", help="Run ModelSim in GUI mode")
     parser.add_argument("--dump", action="store_true", help="Collect dump file")
     parser.add_argument("--dump-mem", action="store_true", help="Collect dump file including memories")
-    parser.add_argument("--codecov", action="store_true", help="Collect code coverage")
+    parser.add_argument("--codecov", action="store_true", help="Collect code coverage "
+                        "(statement, branch, condition, expression, FSM, toggle) on the "
+                        "design's RTL; writes coverage.ucdb and coverage.txt in the run directory")
     parser.add_argument("--sim_args", action="append", nargs="*", help="Command arguments to pass to simulation process")
     parser.add_argument("--comp_args", action="append", nargs="*", help="Command arguments to pass to compilation process")
 

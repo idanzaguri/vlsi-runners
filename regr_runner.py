@@ -257,17 +257,66 @@ def summarize_results(results, summary_path, total_tests, start_time, pedant=Fal
         summary_file.write(summary_content)
 
 def merge_coverage(regression_dir):
-    """Merges coverage databases for each block, logging output to a file."""
-    for block_dir in regression_dir.iterdir():
-        if block_dir.is_dir():
-            ucdb_files = list(block_dir.glob("**/coverage.ucdb"))
-            if ucdb_files:
-                merge_log = block_dir / "merge.log"
-                merge_cmd = ["vcover", "merge", str(block_dir / "merged.ucdb")] + [str(f) for f in ucdb_files]
-                
-                print_message("info", f"Merging coverage for block: {block_dir}")
-                with open(merge_log, "w") as log_file:
-                    subprocess.run(merge_cmd, stdout=log_file, stderr=log_file, check=True)
+    """Merge every member's coverage database, one merged file per block,
+    and report on it.
+
+    A block is one design, so the merge stops at the block: adding two
+    designs' bins together would mean nothing. Each block gets
+    ``merged.ucdb``, ``coverage.txt`` (the totals table, also printed and
+    appended to the regression summary) and ``coverage_html/`` to browse;
+    ``merge.log`` holds the tools' own output. Returns ``{block: table}``,
+    the table as the lines of coverage.txt, for the blocks that had any
+    database to merge. A failed tool step is reported and skipped, never
+    fatal: the regression's verdict is already in."""
+    tables = {}
+    for block_dir in sorted(regression_dir.iterdir()):
+        # `_build` holds the shared design libraries, not a block's runs
+        if not block_dir.is_dir() or block_dir.name.startswith("_"):
+            continue
+        ucdb_files = sorted(block_dir.glob("**/coverage.ucdb"))
+        if not ucdb_files:
+            continue
+        merged = block_dir / "merged.ucdb"
+        report = block_dir / "coverage.txt"
+        # a list file: 780 members would overflow a command line
+        inputs = block_dir / "merge_inputs.txt"
+        inputs.write_text("".join(f"{f}\n" for f in ucdb_files))
+        steps = [
+            ["vcover", "merge", "-inputs", str(inputs), "-out", str(merged)],
+            ["vcover", "report", "-summary", "-output", str(report), str(merged)],
+            ["vcover", "report", "-html", "-output", str(block_dir / "coverage_html"), str(merged)],
+        ]
+        print_message("info", f"merging {len(ucdb_files)} coverage database(s) of {block_dir.name}")
+        merge_log = block_dir / "merge.log"
+        with open(merge_log, "w") as log_file:
+            for cmd in steps:
+                r = subprocess.run(cmd, stdout=log_file, stderr=log_file)
+                if r.returncode:
+                    print_message("warning", f"{cmd[0]} {cmd[1]} failed for {block_dir.name}, "
+                                             f"see {merge_log}")
+                    break
+        try:
+            tables[block_dir.name] = [l.rstrip() for l in report.read_text().splitlines() if l.strip()]
+        except OSError:
+            pass
+    return tables
+
+
+def report_coverage(tables, regression_dir, summary_path):
+    """Print each block's totals and append them to the summary."""
+    if not tables:
+        print_message("warning", "no coverage database was found to merge")
+        return
+    lines = []
+    for block, table in tables.items():
+        block_dir = regression_dir / block
+        lines += [f"Block: {block}", *table,
+                  f"UCDB: {block_dir / 'merged.ucdb'}",
+                  f"HTML: {block_dir / 'coverage_html' / 'index.html'}", ""]
+    text = "\n".join(lines)
+    print(text)
+    with open(summary_path, "a") as f:
+        f.write(f"{'-'*40}\nCoverage:\n{text}\n")
 
 
 
@@ -304,7 +353,8 @@ def main():
     parser.add_argument("--repeat", type=int, default=1, help="Number of times to run each test")
     parser.add_argument("--max_parallel", type=int, default=16, help="Maximum parallel tests")
     parser.add_argument("--stop_on_fail", action="store_true", help="Stop on first failure")
-    parser.add_argument("--codecov", action="store_true", help="Enable code coverage")
+    parser.add_argument("--codecov", action="store_true", help="Collect code coverage on every "
+                        "member and merge it per block (see test_runner --codecov)")
     parser.add_argument("--keep", action="store_true", help="Disable passesd tests files folders cleaning")
     parser.add_argument("--pedant", action="store_true", help="Treat tests that pass with warnings as failures (affects pass rate and stop_on_fail)")
     parser.add_argument("--timeout", type=int, default=300, help="Per-test wall-clock timeout in seconds; a test exceeding it is killed and marked FAILED (default: 300)")
@@ -507,7 +557,8 @@ def main():
     pbar.close() 
     print()
     if args.codecov:
-        merge_coverage(regression_dir)
+        report_coverage(merge_coverage(regression_dir), regression_dir,
+                        regression_dir / "summary.txt")
     
     effective_passed = passed_tests + (0 if args.pedant else passed_warn_tests)
     effective_failed = failed_tests + (passed_warn_tests if args.pedant else 0)
