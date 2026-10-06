@@ -19,18 +19,32 @@ from pathlib import Path
 from tqdm import tqdm
 
 
-def _timed_out_but_finished_cleanly(text):
+def _timed_out_but_finished_cleanly(text, expect_fail=None):
     """A common Modelsim/Questa flake: $finish runs and the UVM report shows
     a clean pass, but the simulator process then hangs (e.g., license-server
-    drop) and gets killed by the wall-clock timeout. The test logically
-    passed -- recognize it so it doesn't show up as a real failure."""
-    if "$finish" not in text:
+    drop, "Read failure in vlm process") and gets killed by the wall-clock
+    timeout. The test logically passed -- recognize it so it doesn't show up
+    as a real failure.
+
+    The proof is the UVM report summary printed before $finish, with zero
+    UVM_ERROR and UVM_FATAL, and no simulator error before $finish. A
+    Synopsys VIP's "SvtTestEpilog: Passed" counts too, but an env without
+    that VIP never prints it, so it is not required: the rule once asked for
+    it and every such flake in a plain-UVM env read as a failure. A test that
+    declares expect_fail never counts: its verdict needs the failure it
+    expects, which a clean summary says did not happen."""
+    if expect_fail:
         return False
-    if "SvtTestEpilog: Passed" not in text:
+    head, sep, _tail = text.partition("$finish")
+    if not sep:
         return False
-    if not re.search(r"UVM_ERROR\s*:\s*0\b", text):
+    if "SvtTestEpilog: Passed" not in text and "UVM Report Summary" not in head:
         return False
-    if not re.search(r"UVM_FATAL\s*:\s*0\b", text):
+    if not re.search(r"UVM_ERROR\s*:\s*0\b", head):
+        return False
+    if not re.search(r"UVM_FATAL\s*:\s*0\b", head):
+        return False
+    if re.search(r"^#? ?\*\* (Error|Fatal)", head, re.M):
         return False
     return True
 
@@ -110,7 +124,8 @@ def run_test(block, test, seed, rundir, codecov=False, simulator="modelsim",
     log_text = (stdout or "") + "\n" + (stderr or "")
     # When the timeout fires after $finish (common Modelsim license/post-finish
     # flake), the UVM summary in the captured log already shows a clean pass.
-    clean_finish_after_timeout = timed_out and _timed_out_but_finished_cleanly(log_text)
+    clean_finish_after_timeout = timed_out and _timed_out_but_finished_cleanly(
+        log_text, expect_fail_of(block, test))
 
     log_path = os.path.join(rundir, "test.log")
     with open(log_path, "w") as log_file:
@@ -158,6 +173,7 @@ def clean_test_files(rundir, success, keep_patterns = ["test.log", "coverage.ucd
 
 
 _comp_cache = {}
+_xfail_cache = {}
 
 
 def comp_of_tests(block):
@@ -178,7 +194,17 @@ def comp_of_tests(block):
     _comp_cache[block] = {t.get("name"): t.get("comp")
                           for t in (data.get("tests") or [])
                           if t.get("name") and t.get("comp")}
+    _xfail_cache[block] = {t.get("name"): t.get("expect_fail")
+                           for t in (data.get("tests") or [])
+                           if t.get("name") and t.get("expect_fail")}
     return _comp_cache[block]
+
+
+def expect_fail_of(block, test):
+    """The ``expect_fail`` text a test declares in its block's tests.yaml, or
+    None (parsed with the compilation names, once per block)."""
+    comp_of_tests(block)
+    return _xfail_cache.get(block, {}).get(test)
 
 
 def build_lib(block, comp, test, build_dir, codecov=False, simulator="modelsim"):
