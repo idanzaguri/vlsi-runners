@@ -14,6 +14,7 @@ the runner code lives here.
 | `regr_runner.py` | run a list of tests in parallel, summarize, merge coverage | `python3 bin/runners/regr_runner.py --tests <regr.yaml> --name <run> [--timeout 300]` |
 | `synth_runner.py` | yosys synthesis for a block (templates in `synth/`) | `python3 bin/runners/synth_runner.py -b <block> [--top <mod>]` |
 | `metric_runner.py` | synthesize + report relative area/timing, diff two designs | `python3 bin/runners/metric_runner.py -b <block_a> --vs <block_b>` |
+| `pnr_runner.py` | place-and-time on a public library (OpenROAD), diff two designs | `python3 bin/runners/pnr_runner.py -b <block_a> --vs <block_b> --period 1.0` |
 
 `test_runner` selects the test from `verif/<block>/lib/tests.yaml`; a CLI `--uvm_test`
 overrides the one baked into the entry (handy for many flavors of one test class).
@@ -72,6 +73,59 @@ absolute values are meaningless, only the diff between two designs matters): chi
 cell count (`stat`) and critical-path logic depth (`ltp`). `--vs <block>[:<top>]`
 synthesizes a second design and prints a delta table; each run also drops a
 `metrics.json` under `metrics/<block>/<top>/`.
+
+### Place-and-time numbers (`pnr_runner`)
+
+`metric_runner` stops at logic depth on a toy library, which says nothing about
+wire delay or about what a real library makes of a carry chain. `pnr_runner` takes
+the same design through OpenROAD-flow-scripts (ORFS) on **Nangate45** (a public 45 nm
+library: absolute numbers are meaningless, only the diff between two forms of one
+module matters) and reports what placement knows:
+
+| group | what |
+|---|---|
+| timing | WNS, TNS, the minimum period (so Fmax), per clock |
+| critical path | start and end register, cells on it (this flow's logic depth), arrival, slack |
+| cells | count, flops, cell area, utilization |
+| wire | HPWL of every net summed and the longest one, ORFS's estimated length, and in `full` mode the routed length |
+| nets | for each net named with `--nets`: pins, HPWL, routed length |
+
+```bash
+# one design, fast: synth, floorplan, place, STA on placement parasitics (minutes)
+bin/runners/pnr_runner.py -b bfly8 --clock clk --period 1.25
+# a filelist instead of a block; two periods; name a few nets
+bin/runners/pnr_runner.py -f ni.f --top ni_top --clock clk --period 1.0,0.8 --nets u_x.req_q[3]
+# A against B: one delta table per period
+bin/runners/pnr_runner.py -f a.f --top a_mod --vs b.f:b_mod --clock clk --period 1.0
+# through CTS and detailed route, for routed wire lengths
+bin/runners/pnr_runner.py -b bfly8 --mode full
+```
+
+Each run lands in `pnr/<design>/<top>/<pdk>_<mode>_p<period>/`: `metrics.json` (the
+numbers above), `report.txt`, `constraint.sdc` and `config.mk` as given to ORFS,
+`make.log`, `report/paths.txt` (the worst path in full), and `orfs/` with ORFS's own
+`logs`, `reports` and `results` (the ODB files, which `openroad -gui` opens). A `--vs`
+run also writes the table under `pnr/compare/`.
+
+The RTL is read with yosys's **slang** frontend (`SYNTH_HDL_FRONTEND=slang`, with
+`SYNTHESIS` defined), since the generated SystemVerilog-2017 is beyond the plain
+reader. Seeds are fixed (`--seed`, default 42) and `SYNTH_REPEATABLE_BUILD` is on, so
+two runs of one design print the same numbers. A design that crosses clock domains
+must pass its own SDC with `--sdc`; it is sourced after the runner's clocks, with its
+Vivado spellings translated for OpenSTA (see the docstring of `write_sdc`), and any
+constraint that matched nothing in the netlist is listed in `metrics.json` under
+`sdc_unmatched` and warned about, since a bound on a missing cell constrains nothing.
+One caveat the runner does not hide: that SDC also declares the clocks asynchronous
+(`set_clock_groups -asynchronous`), and in OpenSTA, as in PrimeTime, clock groups take
+precedence over `set_max_delay`, so the bounded crossing paths are not timed at all;
+the bounds only act when the groups are removed, and then every crossing the bounds
+miss is timed clock-to-clock. Which of the two the measurement wants is the SDC
+author's call. Net names for `--nets` are the flat netlist's (`u_rd.rmask_q[15]`, as
+in `orfs/results/.../1_2_yosys.v` without the leading backslash). `--pdk asap7` runs
+the same flow on ASAP7 (its times are in ps; the runner converts); checked on one NI.
+
+The toolchain is the ORFS checkout at `/src/tools/OpenROAD-flow-scripts` (or
+`$ORFS_HOME`, or `--orfs`): see [docs/install-openroad.md](docs/install-openroad.md).
 
 ## Use in a project
 

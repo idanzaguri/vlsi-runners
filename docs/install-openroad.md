@@ -1,10 +1,22 @@
 # Installing OpenROAD (place & route, via OpenROAD-flow-scripts)
 
-For the backend study we need real **place-and-route** numbers — wire length,
-achieved Fmax, area, and PnR runtime — not just synthesis estimates. The
+> **Status on this machine (2026-10-11):** installed and working at
+> `/src/tools/OpenROAD-flow-scripts` (ORFS 26Q3, OpenROAD 26Q3-771, its own yosys 0.67+
+> with the slang frontend built in). KLayout is NOT installed (see the 26.04 note), so
+> the flow is run without the GDS step; `pnr_runner.py` does that for you
+> (`make finish GDS_FINAL_FILE=`). The gcd smoke design has been run end to end.
+>
+> **Path convention:** the runners look for ORFS at `/src/tools/OpenROAD-flow-scripts`,
+> then `$ORFS_HOME`, then `--orfs`. The tools are called by absolute path from under
+> `tools/install/`, so nothing needs to be on `PATH` for the runners; `source env.sh`
+> is only for working by hand. `/opt/yosys` (metric_runner's yosys) and ORFS's yosys
+> coexist and are never mixed.
+
+For the backend study we need real **place-and-route** numbers (wire length,
+achieved Fmax, area, and PnR runtime), not just synthesis estimates. The
 open-source ASIC P&R flow is **OpenROAD**, driven through **OpenROAD-flow-scripts
 (ORFS)**: a make-based RTL-to-GDS wrapper that bundles OpenROAD + yosys + the
-open **Nangate45** cell library (a fake-but-consistent 45 nm library — absolute
+open **Nangate45** cell library (a fake-but-consistent 45 nm library; absolute
 numbers are meaningless, only the diff between two designs matters, which is
 exactly what we want).
 
@@ -17,7 +29,7 @@ time; it is RAM-heavy (needs ~a few GB per core at peak).
 ## Conventions
 
 - **Source tree at `/src/tools/OpenROAD-flow-scripts`** (matches the yosys layout
-  at `/src/tools/yosys`). Keep it — it is both the toolchain and the flow driver.
+  at `/src/tools/yosys`). Keep it: it is both the toolchain and the flow driver.
 - ORFS builds its own pinned yosys/OpenROAD under its tree; that is separate from
   the standalone `/opt/yosys` used by `metric_runner`. The two coexist.
 
@@ -38,7 +50,7 @@ git clone --recursive https://github.com/The-OpenROAD-Project/OpenROAD-flow-scri
     /src/tools/OpenROAD-flow-scripts
 cd /src/tools/OpenROAD-flow-scripts
 
-# 3. system + common dependencies  (THE ONE SUDO STEP — run it in a real
+# 3. system + common dependencies  (THE ONE SUDO STEP: run it in a real
 #    terminal; sudo needs a TTY for your password)
 sudo ./setup.sh
 
@@ -65,7 +77,7 @@ path, no source fallback. Two choices:
 
 1. **Defer it (recommended to start).** KLayout is only used at the flow's final
    GDS stream-out + KLayout DRC. Building OpenROAD and getting the study's
-   numbers (area, WNS/Fmax, wire length — all from synth→place→route→STA) do
+   numbers (area, WNS/Fmax, wire length, all from synth, place, route and STA) do
    **not** need it. Run the flow to the route/report stage and skip GDS for now.
 2. **Build KLayout 0.30.7 from source** (Qt5 5.15 is present on 26.04):
    ```bash
@@ -146,7 +158,7 @@ final target is set to the report stage.
 
 Add a design dir under `flow/designs/nangate45/<name>/` with:
 
-- `config.mk` — points at the RTL and sets the top + clock:
+- `config.mk`: points at the RTL and sets the top + clock:
   ```makefile
   export DESIGN_NAME     = <top_module>
   export PLATFORM        = nangate45
@@ -155,7 +167,7 @@ Add a design dir under `flow/designs/nangate45/<name>/` with:
   export DIE_AREA        = 0 0 <w> <h>     # or use CORE_UTILIZATION instead
   export CORE_AREA       = ...
   ```
-- `constraint.sdc` — at least a clock:
+- `constraint.sdc`: at least a clock:
   ```tcl
   create_clock -name clk -period <T_ns> [get_ports clk]
   ```
@@ -179,8 +191,11 @@ make DESIGN_CONFIG=./designs/nangate45/<name>/config.mk
   degrade with N. Same "diff, not absolute" philosophy as `metric_runner`, one
   level down (placement instead of synthesis).
 
-Planned follow-up: an OpenROAD backend for `metric_runner` that parses these
-reports (WNS / wirelength / area) into the same two-design delta table.
+That follow-up exists: `pnr_runner.py` (see the README) writes the ORFS config and
+SDC for a design, runs the flow to placement (`fast`) or through detailed route
+(`full`), measures the result with `pnr/pnr_report.tcl` inside the ORFS environment
+(`make vars` exports it), and prints the same two-design delta table as
+`metric_runner`, with WNS, Fmax, the critical path, cells, area and wire lengths.
 
 ## Updating
 
