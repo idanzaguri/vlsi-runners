@@ -134,6 +134,14 @@ git submodule add git@github.com:idanzaguri/vlsi-runners.git bin/runners
 # fresh clones: git clone --recurse-submodules ...  (or: git submodule update --init)
 ```
 
+## Glossary
+
+[docs/glossary.md](docs/glossary.md) defines every term the runners print or take as
+an option (coverage types, the flow stages, WNS, HPWL, SDC exceptions ...), written
+for a verification engineer who has not done physical design. **It is kept in step
+with the runners: a change that introduces a term, a metric, an option or a tool
+name adds it there in the same commit.**
+
 ## Notes
 - Installing yosys (needed by `synth_runner`/`metric_runner`): see
   [docs/install-yosys.md](docs/install-yosys.md). Build from source (the apt package

@@ -1,0 +1,185 @@
+# Glossary: the terms behind the coverage and place-and-time runners
+
+Written for a verification engineer who has not done physical design.
+Absolute numbers from the free libraries used here mean nothing; every
+runner reports them so two forms of one design can be compared.
+
+## Simulation and coverage (Questa)
+
+- **Code coverage**: the simulator counts which parts of the RTL executed.
+  It needs no testbench code, only a switch, and it tells you what the
+  tests never touched. Types:
+  - **Statement**: each line/statement, executed or not.
+  - **Branch**: each arm of an `if`/`case`, taken or not.
+  - **Condition**: inside a boolean expression, each term seen both true
+    and false (short-circuiting counted).
+  - **Expression**: like condition, for the right-hand side of assignments.
+  - **FSM**: for a state machine the tool recognizes, which states were
+    visited and which transitions happened.
+  - **Toggle**: each signal bit seen going 0 to 1 and 1 to 0.
+- **Functional coverage**: coverage you define yourself in SystemVerilog
+  (`covergroup`, `coverpoint`, bins). It needs the `svverification` license
+  feature, which the Starter Edition lacks, together with `randomize()`.
+- **Assertion coverage**: how many times each assertion passed or failed.
+- **UCDB**: Unified Coverage Database, Questa's binary file holding one
+  run's coverage (`coverage save`). Merged across runs with `vcover merge`.
+- **vcover**: Questa's coverage utility: merge databases, print text or
+  HTML reports.
+- **viewcov**: `vsim -viewcov file.ucdb`, the GUI mode that opens a
+  database without a simulation.
+- **Design unit (DU)**: a compiled module, interface or package in the
+  work library. `vdir -l` lists them with their source file.
+- **Instrumenting**: compiling a unit with coverage counters in it.
+  `-cover` instruments everything; `+cover=<types>+<unit>` only that unit.
+- **Snapshot / optimized design**: the `vopt` output that `vsim` runs
+  without optimizing again (`<top>_opt`).
+
+## From RTL to a placed chip
+
+- **RTL**: the SystemVerilog you write (registers and the logic between
+  them).
+- **Synthesis**: turning RTL into a **netlist** of standard cells (AND,
+  NAND, flops ...) from a library. Done by **yosys** here.
+- **slang**: a SystemVerilog frontend built into yosys 0.67 (`read_slang`).
+  The generated RTL uses SV-2017 that the plain reader rejects.
+- **Standard cell library**: the set of pre-designed gates of a process,
+  with their timing and area. The `.lib` file (Liberty) carries timing,
+  the `.lef` file carries the physical shape.
+- **Toy library**: yosys's `cmos_cells.lib`, a handful of fake gates;
+  what `metric_runner` maps to. Logic depth is the only honest number it
+  gives.
+- **Nangate45**: a free, realistic-looking 45 nm library (FreePDK45). Not
+  a real foundry process, but consistent, so diffs between designs mean
+  something.
+- **ASAP7**: a free academic 7 nm-class library. Smaller and faster; its
+  time unit is picoseconds.
+- **PDK**: process design kit, the library plus technology rules for one
+  process. The runner's `--pdk` picks nangate45 or asap7.
+- **OpenROAD**: the open-source place-and-route tool. **OpenSTA** is its
+  timing engine (also available alone as `sta`).
+- **ORFS**: OpenROAD-flow-scripts, the make-based flow that drives yosys
+  and OpenROAD stage by stage from RTL to a layout. Lives at
+  `/src/tools/OpenROAD-flow-scripts`.
+- **Flow stages**, in order:
+  1. **Synthesis**: RTL to netlist.
+  2. **Floorplan**: decide the die size and the core (the area cells may
+     occupy); place the power grid and tap cells.
+  3. **Placement**: put every cell at an (x, y). **Global placement**
+     spreads cells roughly, **detailed placement** legalizes them onto
+     rows. Timing-driven placement uses timing to keep critical cells
+     close.
+  4. **CTS**: clock tree synthesis, building the buffer tree that delivers
+     the clock to every flop.
+  5. **Routing**: connect the pins with metal wires. **Global route**
+     decides corridors, **detailed route** draws the actual wires.
+  6. **Finish**: fill cells, final timing and reports, optionally the GDS.
+- **fast mode** (runner): stages 1 to 3, then timing with wire delay
+  estimated from placement. **full mode**: through routing, timing on
+  the wires as drawn.
+- **Die area / core area**: the chip outline and the region inside it
+  where cells go. **Core margin** is the gap between them.
+- **Utilization**: cell area divided by core area. The runner targets 50%
+  (`--util`); the reported value is what came out.
+- **Aspect ratio**: core height over width (1 = square).
+- **Placement density**: how tightly the placer packs cells; ORFS derives
+  it from utilization.
+- **Fill cells / tap cells**: cells with no logic, added to satisfy
+  physical rules. Excluded from the runner's cell count.
+- **ODB**: OpenROAD's database file (`3_place.odb`, `6_final.odb`); opens
+  in `openroad -gui`.
+- **GDS**: the final mask layout file. Needs **KLayout**, which this
+  machine lacks, so the flow stops just before it.
+- **DRC**: design rule check, geometric rules the layout must obey.
+- **DBU**: database unit, the integer grid of the ODB (2000 per micron
+  on Nangate45). The runner converts to microns.
+
+## Timing
+
+- **STA**: static timing analysis. Without simulating, compute how long
+  every path takes and compare with what the clock allows.
+- **Clock period**: the time between clock edges. 1.25 ns = 800 MHz.
+  `--period` sets it; a sweep runs once per period.
+- **Path**: logic from a launching point to a capturing point.
+  **Startpoint** and **endpoint** name those two.
+- **Register-to-register (reg-to-reg) path**: flop to flop inside the
+  design. The number the open items are about.
+- **Port path / IO path**: from an input port to a flop, or a flop to an
+  output port. Depends on an assumed outside world, so it is noise when
+  measuring a module alone.
+- **IO budget / input and output delay**: the assumption about that
+  outside world. The runner gives 20% of the period on each side through a
+  **virtual clock** (a clock with no port, used only to time the ports).
+- **Arrival time**: when the signal gets to the endpoint.
+  **Required time**: when it had to be there (period minus setup time).
+- **Setup time**: how early data must be stable before the clock edge.
+  **Hold time**: how long after the edge it must stay stable.
+- **Slack**: required minus arrival. Positive is good (met), negative is a
+  violation.
+- **WNS**: worst negative slack, the single worst path. 0 or positive
+  means timing closes at that period.
+- **TNS**: total negative slack, the sum over all violating endpoints. How
+  much is broken, not only how badly.
+- **Critical path**: the path with the worst slack.
+- **Minimum period / Fmax**: the shortest period the worst reg-to-reg
+  path allows (period minus its slack, with skew); Fmax = 1 / min period.
+  Independent of where the constraint was set, so it is the number to
+  compare.
+- **Logic depth / path cells**: how many cells sit between the two
+  registers of a path. The toy-library measure (`ltp`) counted gate
+  levels; the runner counts cells on the placed critical path.
+- **Parasitics**: the resistance and capacitance of the wires, which add
+  delay. **Estimated** from placement (fast mode) or **extracted** from
+  the drawn wires into a **SPEF** file (full mode).
+- **Wire delay**: the part of a path's delay that comes from wires rather
+  than gates. Invisible before placement; the reason this runner exists.
+- **Clock skew**: the clock arriving at different flops at different
+  times.
+
+## Constraints (SDC)
+
+- **SDC**: Synopsys Design Constraints, the Tcl file that tells STA about
+  clocks and exceptions. ORFS reads it at every stage.
+- **create_clock**: defines a clock on a port with a period.
+- **set_input_delay / set_output_delay**: the IO budget.
+- **Clock domain crossing (CDC)**: a signal moving between two
+  unrelated clocks. Needs a synchronizer, here a FIFO with
+  **gray-code pointers** (only one bit changes per step, so a late bit
+  cannot produce a wrong count).
+- **set_clock_groups -asynchronous**: declares clocks unrelated; STA then
+  times no path between them.
+- **set_max_delay**: a bound on a path's delay regardless of clocks. The
+  generated SDC uses it to keep gray-pointer paths short ("placed but
+  never cut").
+- **set_false_path**: tells STA to ignore a path.
+- **Exception precedence**: when two constraints cover one path, clock
+  groups and false paths win over max delay, which wins over multicycle.
+  This is why the gray bounds time nothing while the clocks are declared
+  asynchronous.
+- **-datapath_only** (Vivado) and **-ignore_clock_latency** (OpenSTA):
+  the same idea, time only the data path of a max-delay bound.
+- **Register naming**: yosys names a flop after its output net plus the
+  flop type, `u_x.wgray[3]$_DFF_PN0_`; Vivado and Synopsys use
+  `u_x/wgray_reg[3]`. The runner translates the SDC patterns.
+- **Unmatched SDC object**: a pattern that names nothing in the netlist.
+  It constrains nothing, silently; the runner lists them.
+
+## Wires and area
+
+- **HPWL**: half-perimeter wire length, the width plus height of the box
+  around a net's pins. A placement-only estimate of how long the net will
+  be, summed over all nets as the design's total.
+- **Routed wire length**: the length of the wires actually drawn, per net
+  or in total (full mode only).
+- **Net**: one electrical connection, from a driver to its loads.
+  **Pins** are where it touches cells or ports. A high-pin-count net
+  (reset, enable) is usually the longest.
+- **Cell area**: the sum of the cells' areas in square microns. The one
+  area number a library makes meaningful.
+- **Flops**: the registers (`all_registers` in OpenSTA).
+
+## Determinism
+
+- **Seed**: the random seed of the placer and router. Fixed by the runner
+  (`--seed`, default 42) so two runs of one design print the same numbers.
+- **SYNTH_REPEATABLE_BUILD**: an ORFS switch that removes the remaining
+  sources of run-to-run variation in synthesis.
