@@ -11,11 +11,16 @@ the main entry.
     pnr_runner.py -f <filelist> --top <module> --clock clk --period 1.0,0.8
     pnr_runner.py ... --vs <block>[:<top>]        # delta table, A against B
     pnr_runner.py ... --mode full                 # through detailed route
+    pnr_runner.py ... --name <run> --vs-name <run>   # the folders under pnr/
+    pnr_runner.py ... --var SYNTH_MEMORY_MAX_BITS=65536   # any ORFS variable
 
 Fast mode runs synthesis, floorplan and placement and times the placed design
 with placement parasitics: minutes on a 30k-cell NI. Full mode goes through
 CTS and detailed route for routed wire lengths, and times on the extracted
-parasitics. One JSON per run under pnr/<design>/<top>/<pdk>_<mode>_p<period>/.
+parasitics. One JSON per run under pnr/<name>/<top>/<pdk>_<mode>_p<period>/,
+where <name> is the block, the filelist's stem, or `--name`. A folder that
+holds a measured run of another design or setup is never overwritten by
+accident: the runner refuses until `--name` or `--clean` says which.
 
 The toolchain is the ORFS checkout in /src/tools/OpenROAD-flow-scripts (see
 docs/install-openroad.md): its own OpenROAD and its own yosys, read through
@@ -94,19 +99,20 @@ def _fmt(v, kind):
 class Design:
     """A top module and the files, include dirs and defines that build it."""
 
-    def __init__(self, name, top, files, include_dirs=(), defines=()):
+    def __init__(self, name, top, files, include_dirs=(), defines=(), source=None):
         self.name = name
         self.top = top
         self.files = [os.path.abspath(f) for f in files]
         self.include_dirs = [os.path.abspath(d) for d in include_dirs]
         self.defines = list(defines)
+        self.source = source  # the block spec or the filelist, for the record
 
     @property
     def label(self):
         return f"{self.name}/{self.top}"
 
 
-def design_from_block(spec):
+def design_from_block(spec, name=None):
     """`<block>[:<top>]` from design/<block>/lib/config.yaml, the file
     metric_runner and synth_runner read, so the three agree on a block."""
     block, _, top = spec.partition(":")
@@ -118,14 +124,17 @@ def design_from_block(spec):
     if not attrs["files"]:
         print_message("error", f"design block '{block}' lists no files")
         exit(1)
-    return Design(block, top, attrs["files"], attrs["include_dirs"], attrs["defines"])
+    return Design(name or block, top, attrs["files"], attrs["include_dirs"], attrs["defines"],
+                  source=f"block {spec}")
 
 
-def design_from_filelist(path, top):
+def design_from_filelist(path, top, name=None):
     """A plain filelist: one source file per line, relative to the list's own
     directory, plus `+incdir+<dir>`, `+define+<name>[=<value>]` and `-f <list>`
     lines, `#` and `//` comments. The simulator's format, so a filelist that
-    compiles is a filelist that places."""
+    compiles is a filelist that places. The run is named after the list's
+    stem unless `name` says otherwise (six lists called ni.f are six runs
+    only with six names)."""
     files, incdirs, defines = [], [], []
 
     def read(p):
@@ -155,11 +164,11 @@ def design_from_filelist(path, top):
     if not files:
         print_message("error", f"filelist {path} names no source file")
         exit(1)
-    name = os.path.splitext(os.path.basename(path))[0]
-    return Design(name, top, files, incdirs, defines)
+    name = name or os.path.splitext(os.path.basename(path))[0]
+    return Design(name, top, files, incdirs, defines, source=os.path.abspath(path))
 
 
-def parse_design_spec(spec, top=None):
+def parse_design_spec(spec, top=None, name=None):
     """`-b`/`--vs` syntax: a block (`<block>[:<top>]`) or a filelist
     (`<path>.f[:<top>]`, anything with a slash or an .f suffix)."""
     if "/" in spec or spec.endswith(".f") or ".f:" in spec:
@@ -168,14 +177,14 @@ def parse_design_spec(spec, top=None):
         if not t:
             print_message("error", f"a filelist needs a top module: {spec}:<top> or --top")
             exit(1)
-        return design_from_filelist(path, t)
-    return design_from_block(spec)
+        return design_from_filelist(path, t, name)
+    return design_from_block(spec, name)
 
 
 # ----------------------------------------------------------------------
 # Constraints
 # ----------------------------------------------------------------------
-def write_sdc(path, design, clocks, period_ns, time_ns, user_sdc):
+def sdc_text(design, clocks, period_ns, time_ns, user_sdc):
     """The clocks at this run's period, the IO budget, then the design's own
     SDC rewritten for this flow.
 
@@ -232,8 +241,7 @@ def write_sdc(path, design, clocks, period_ns, time_ns, user_sdc):
                 return "get_cells {" + pat + "}"
             line = re.sub(r"get_cells\s+\{([^}]*)\}", cells, line)
             lines.append(line)
-    with open(path, "w") as f:
-        f.write("\n".join(lines) + "\n")
+    return "\n".join(lines) + "\n"
 
 
 # ----------------------------------------------------------------------
@@ -246,7 +254,11 @@ def orfs_env(orfs):
     return env
 
 
-def write_config(path, design, pdk, sdc, util, jobs, seed):
+def config_text(design, pdk, sdc, util, jobs, seed, variables=()):
+    """ORFS's config.mk for this run. `variables` (from `--var`) go last, so
+    they override the runner's own choices: ORFS reads every documented
+    variable from here (flow/scripts/variables.yaml lists them), and a run's
+    folder then records what it was given."""
     files = " ".join(design.files)
     lines = [
         "# written by pnr_runner",
@@ -271,8 +283,58 @@ def write_config(path, design, pdk, sdc, util, jobs, seed):
         lines.append("export VERILOG_DEFINES = " + " ".join(f"-D {d}" for d in design.defines))
     if jobs:
         lines.append(f"export NUM_CORES = {jobs}")
-    with open(path, "w") as f:
-        f.write("\n".join(lines) + "\n")
+    if variables:
+        lines.append("# --var")
+        lines += [f"export {k} = {v}" for k, v in variables]
+    return "\n".join(lines) + "\n"
+
+
+def _config_vars(text):
+    """`export K = V` lines as a dict, without the ones that change no number."""
+    d = {}
+    for line in text.splitlines():
+        m = re.match(r"\s*export\s+(\w+)\s*=\s*(.*)$", line)
+        if m and m.group(1) != "NUM_CORES":
+            d[m.group(1)] = m.group(2).strip()
+    return d
+
+
+def other_setup_in(rundir, config, sdc):
+    """What an earlier run in this directory was given differently (the
+    config.mk variables, or the SDC), or None. Two filelists both called
+    ni.f with different RTL land in one directory, and the second used to
+    overwrite the first's numbers without a word."""
+    differs = []
+    old = os.path.join(rundir, "config.mk")
+    if os.path.isfile(old):
+        was, now = _config_vars(open(old).read()), _config_vars(config)
+        differs += sorted(k for k in set(was) | set(now) if was.get(k) != now.get(k))
+    old = os.path.join(rundir, "constraint.sdc")
+    if os.path.isfile(old) and open(old).read() != sdc:
+        differs.append("constraint.sdc")
+    return ", ".join(differs) or None
+
+
+def hint_on_failure(work, pdk, top):
+    """ORFS stops synthesis at an inferred memory above SYNTH_MEMORY_MAX_BITS
+    (4096 by default, its guard against a RAM that should be a macro turning
+    into flops). A FIFO in an NI is meant to be flops, so the answer is the
+    bound, and the log has the number."""
+    logs = os.path.join(work, "logs", pdk, top, "base")
+    text = ""
+    for name in ("1_2_yosys.log", "1_1_yosys.log", "1_synth.log"):
+        try:
+            text += open(os.path.join(logs, name)).read()
+        except OSError:
+            pass
+    if "SYNTH_MEMORY_MAX_BITS" not in text or "exceeds" not in text:
+        return
+    m = re.search(r"Largest single memory instance:\s+(\d+)\s+bits\s*\(module\s+([^)\s]+)", text)
+    what = f"{m.group(1)} bits in {m.group(2)}" if m else "see the synthesis log"
+    bits = m.group(1) if m else "<bits>"
+    print_message("info", f"an inferred memory is above ORFS's SYNTH_MEMORY_MAX_BITS ({what}). "
+                          f"Rerun with --var SYNTH_MEMORY_MAX_BITS={bits} to build it from flops, "
+                          f"or --var SYNTH_MOCK_LARGE_MEMORIES=1 to shrink it to one row")
 
 
 def run_orfs(orfs, rundir, config, work, target, log, extra=()):
@@ -400,17 +462,36 @@ def place_and_time(args, design, period_ns, nets):
     rundir = os.path.join(wa_root, "pnr", design.name, design.top, tag)
     if args.clean:
         shutil.rmtree(rundir, ignore_errors=True)
-    os.makedirs(rundir, exist_ok=True)
     work = os.path.join(rundir, "orfs")
     config = os.path.join(rundir, "config.mk")
     sdc = os.path.join(rundir, "constraint.sdc")
     make_log = os.path.join(rundir, "make.log")
     report_dir = os.path.join(rundir, "report")
+
+    sdc_new = sdc_text(design, args.clock, period_ns, time_ns, args.sdc)
+    config_new = config_text(design, pdk, sdc, args.util, args.jobs, args.seed, args.var)
+    # the same setup again is an incremental rerun (make skips what is
+    # done); another setup must not land on a measured run's numbers, and
+    # may replace a run that never got to them
+    differs = other_setup_in(rundir, config_new, sdc_new)
+    if differs and os.path.isfile(os.path.join(rundir, "metrics.json")):
+        print_message("error", f"{rundir} holds a measured run of another design or setup "
+                               f"(differs in: {differs}). Name this run with --name "
+                               f"(--vs-name for the --vs design), or --clean to replace it")
+        return None
+    if differs:
+        print_message("warning", f"{rundir} held an unmeasured run of another setup "
+                                 f"(differs in: {differs}); replaced")
+        shutil.rmtree(rundir, ignore_errors=True)
     os.makedirs(report_dir, exist_ok=True)
 
     print_message("info", f"{design.label}: {args.mode} on {pdk} at {period_ns:g} ns -> {rundir}")
-    write_sdc(sdc, design, args.clock, period_ns, time_ns, args.sdc)
-    write_config(config, design, pdk, sdc, args.util, args.jobs, args.seed)
+    # ORFS's stages depend on the config and the SDC by mtime, so an
+    # unchanged file is left alone and the rerun picks up where it stopped
+    for path, text in ((sdc, sdc_new), (config, config_new)):
+        if not (os.path.isfile(path) and open(path).read() == text):
+            with open(path, "w") as f:
+                f.write(text)
     open(make_log, "w").close()
 
     t0 = time.time()
@@ -423,6 +504,7 @@ def place_and_time(args, design, period_ns, nets):
         r = run_orfs(orfs, rundir, config, work, "finish", make_log, ["GDS_FINAL_FILE="])
     if r:
         print_message("error", f"ORFS failed ({r}); log: {make_log}")
+        hint_on_failure(work, pdk, design.top)
         return None
     r = run_orfs(orfs, rundir, config, work, "vars", make_log)
     if r:
@@ -524,8 +606,8 @@ def place_and_time(args, design, period_ns, nets):
             "paths": os.path.join(report_dir, "paths.txt"),
             "orfs_logs": logs, "orfs_results": results,
             "flow_elapsed_s": round(flow_elapsed, 1),
-            "files": design.files, "sdc": sdc, "user_sdc": args.sdc,
-            "seed": args.seed,
+            "files": design.files, "source": design.source, "sdc": sdc, "user_sdc": args.sdc,
+            "seed": args.seed, "vars": dict(args.var),
         },
     }
     with open(os.path.join(rundir, "metrics.json"), "w") as f:
@@ -632,6 +714,10 @@ def main():
     src.add_argument("-f", "--filelist", metavar="FILE",
                      help="a filelist (paths relative to it, +incdir+, +define+); needs --top")
     p.add_argument("--top", help="top module (with --filelist)")
+    p.add_argument("--name", metavar="NAME",
+                   help="the run's name, the first level under pnr/ (default: the block name, "
+                        "or the filelist's stem)")
+    p.add_argument("--vs-name", metavar="NAME", help="the same for the --vs design")
     p.add_argument("--clock", action="append", metavar="PORT[=PERIOD_NS]", default=[],
                    help="a clock port; the first is the primary one. Without =PERIOD it "
                         "takes the --period sweep (default: clk)")
@@ -653,6 +739,9 @@ def main():
     p.add_argument("--seed", type=int, default=42, help="placement and routing seed (default: 42)")
     p.add_argument("--orfs", default=os.environ.get("ORFS_HOME", ORFS_DEFAULT),
                    help=f"OpenROAD-flow-scripts checkout (default: $ORFS_HOME or {ORFS_DEFAULT})")
+    p.add_argument("--var", action="append", default=[], metavar="NAME=VALUE",
+                   help="an ORFS variable, written into config.mk after the runner's own "
+                        "(e.g. SYNTH_MEMORY_MAX_BITS=65536 for a FIFO above 4096 bits); repeatable")
     p.add_argument("--clean", action="store_true", help="remove the run directory first")
     args = p.parse_args()
 
@@ -664,6 +753,15 @@ def main():
     if args.sdc and not os.path.isfile(args.sdc):
         p.error(f"no such SDC: {args.sdc}")
     args.sdc = os.path.abspath(args.sdc) if args.sdc else None
+    variables = []
+    for v in args.var:
+        k, sep, val = v.partition("=")
+        if not sep or not re.fullmatch(r"\w+", k):
+            p.error(f"--var takes NAME=VALUE: {v}")
+        variables.append((k, val))
+    args.var = variables
+    if args.vs_name and not args.vs:
+        p.error("--vs-name needs --vs")
 
     clocks = []
     for c in args.clock or ["clk"]:
@@ -676,8 +774,11 @@ def main():
     if args.nets_file:
         nets += [l.strip() for l in open(args.nets_file) if l.strip() and not l.startswith("#")]
 
-    a = design_from_block(args.block) if args.block else design_from_filelist(args.filelist, args.top)
-    b = parse_design_spec(args.vs, args.top) if args.vs else None
+    a = (design_from_block(args.block, args.name) if args.block
+         else design_from_filelist(args.filelist, args.top, args.name))
+    b = parse_design_spec(args.vs, args.top, args.vs_name) if args.vs else None
+    if b and b.name == a.name and b.top == a.top:
+        p.error(f"both designs would run as pnr/{a.name}/{a.top}; give one a --name or --vs-name")
 
     failed = False
     for period in periods:

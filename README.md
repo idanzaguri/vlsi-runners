@@ -97,22 +97,42 @@ bin/runners/pnr_runner.py -b bfly8 --clock clk --period 1.25
 bin/runners/pnr_runner.py -f ni.f --top ni_top --clock clk --period 1.0,0.8 --nets u_x.req_q[3]
 # A against B: one delta table per period
 bin/runners/pnr_runner.py -f a.f --top a_mod --vs b.f:b_mod --clock clk --period 1.0
+# two filelists with one name (d4/ni.f, d8/ni.f): name the runs
+bin/runners/pnr_runner.py -f d4/ni.f --top ni --name ni_d4 --vs d8/ni.f:ni --vs-name ni_d8
+# a FIFO above 4096 bits: raise ORFS's bound (any ORFS variable goes this way)
+bin/runners/pnr_runner.py -f ni.f --top ni --var SYNTH_MEMORY_MAX_BITS=65536
 # through CTS and detailed route, for routed wire lengths
 bin/runners/pnr_runner.py -b bfly8 --mode full
 ```
 
-Each run lands in `pnr/<design>/<top>/<pdk>_<mode>_p<period>/`: `metrics.json` (the
+Each run lands in `pnr/<name>/<top>/<pdk>_<mode>_p<period>/`: `metrics.json` (the
 numbers above), `report.txt`, `constraint.sdc` and `config.mk` as given to ORFS,
 `make.log`, `report/paths.txt` (the worst path in full), and `orfs/` with ORFS's own
 `logs`, `reports` and `results` (the ODB files, which `openroad -gui` opens). A `--vs`
 run also writes the table under `pnr/compare/`.
+
+The name is the block, the filelist's stem, or `--name` (`--vs-name` for the second
+design). Two filelists both called `ni.f` that hold different RTL would land in one
+folder, so before writing anything the runner compares the folder's `config.mk` and
+`constraint.sdc` with what this run would write: the same setup again is an incremental
+rerun (make skips the stages that are done), another setup on top of a measured run
+is refused with the differing variables named (give it a `--name`, or `--clean` to
+replace), and another setup on top of a run that never reached `metrics.json` replaces
+it.
+
+`--var NAME=VALUE` writes any ORFS variable into `config.mk` after the runner's own, so
+it wins and the folder records it (`flow/scripts/variables.yaml` in ORFS lists them
+all). The one that comes up: ORFS stops synthesis at an inferred memory above
+`SYNTH_MEMORY_MAX_BITS` (4096 bits), its guard against a RAM that should be a macro
+turning into flops. A NoC FIFO is meant to be flops, so raise the bound; the runner
+spots that failure in the log and prints the size and the `--var` to use.
 
 The RTL is read with yosys's **slang** frontend (`SYNTH_HDL_FRONTEND=slang`, with
 `SYNTHESIS` defined), since the generated SystemVerilog-2017 is beyond the plain
 reader. Seeds are fixed (`--seed`, default 42) and `SYNTH_REPEATABLE_BUILD` is on, so
 two runs of one design print the same numbers. A design that crosses clock domains
 must pass its own SDC with `--sdc`; it is sourced after the runner's clocks, with its
-Vivado spellings translated for OpenSTA (see the docstring of `write_sdc`), and any
+Vivado spellings translated for OpenSTA (see the docstring of `sdc_text`), and any
 constraint that matched nothing in the netlist is listed in `metrics.json` under
 `sdc_unmatched` and warned about, since a bound on a missing cell constrains nothing.
 One caveat the runner does not hide: that SDC also declares the clocks asynchronous

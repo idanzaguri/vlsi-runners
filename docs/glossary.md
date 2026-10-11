@@ -42,6 +42,18 @@ runner reports them so two forms of one design can be compared.
   NAND, flops ...) from a library. Done by **yosys** here.
 - **slang**: a SystemVerilog frontend built into yosys 0.67 (`read_slang`).
   The generated RTL uses SV-2017 that the plain reader rejects.
+- **Inferred memory**: an array in the RTL (`logic [W-1:0] mem [D]`) that
+  yosys recognizes as a memory. This flow has no RAM macros, so it becomes
+  one flop per bit, which is what a NoC FIFO is anyway.
+- **SYNTH_MEMORY_MAX_BITS**: ORFS's bound on an inferred memory, 4096 bits
+  by default, its guard against a RAM that should be a macro turning into
+  flops. Synthesis stops above it; `--var SYNTH_MEMORY_MAX_BITS=<n>` raises
+  it, `--var SYNTH_MOCK_LARGE_MEMORIES=1` shrinks the memory to one row
+  instead (the rest of the design is then measured without it).
+- **ORFS variable / config.mk**: the make variables that drive the flow
+  (`flow/scripts/variables.yaml` in ORFS documents every one). The runner
+  writes the ones it chooses into the run's `config.mk`; `--var NAME=VALUE`
+  adds any other, last, so it wins.
 - **Standard cell library**: the set of pre-designed gates of a process,
   with their timing and area. The `.lib` file (Liberty) carries timing,
   the `.lef` file carries the physical shape.
@@ -177,9 +189,13 @@ runner reports them so two forms of one design can be compared.
   area number a library makes meaningful.
 - **Flops**: the registers (`all_registers` in OpenSTA).
 
-## Determinism
+## Determinism and bookkeeping
 
 - **Seed**: the random seed of the placer and router. Fixed by the runner
   (`--seed`, default 42) so two runs of one design print the same numbers.
 - **SYNTH_REPEATABLE_BUILD**: an ORFS switch that removes the remaining
   sources of run-to-run variation in synthesis.
+- **Run name**: the first level under `pnr/`: the block, the filelist's
+  stem, or `--name` (`--vs-name` for the second design). A folder that holds
+  a measured run of another design or setup is refused, not overwritten;
+  the same setup again is an incremental rerun.
