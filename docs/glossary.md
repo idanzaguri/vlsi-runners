@@ -131,6 +131,9 @@ runner reports them so two forms of one design can be compared.
   means timing closes at that period.
 - **TNS**: total negative slack, the sum over all violating endpoints. How
   much is broken, not only how badly.
+- **Register-to-register WNS / TNS** (`reg2reg_wns_ns`, `reg2reg_tns_ns`):
+  the same over the paths between registers only, which leaves out the
+  port paths and their made-up IO budget. The numbers to compare.
 - **Critical path**: the path with the worst slack.
 - **Minimum period / Fmax**: the shortest period the worst reg-to-reg
   path allows (period minus its slack, with skew); Fmax = 1 / min period.
@@ -172,8 +175,27 @@ runner reports them so two forms of one design can be compared.
 - **Register naming**: yosys names a flop after its output net plus the
   flop type, `u_x.wgray[3]$_DFF_PN0_`; Vivado and Synopsys use
   `u_x/wgray_reg[3]`. The runner translates the SDC patterns.
-- **Unmatched SDC object**: a pattern that names nothing in the netlist.
-  It constrains nothing, silently; the runner lists them.
+- **Hierarchical pin**: a pin of a module instance rather than of a leaf
+  cell (`u_x_cdc/u_wsync/d[3]`). It exists only while the hierarchy does:
+  the runner keeps what the RTL marks `keep_hierarchy` through yosys and
+  through OpenROAD's link (`OPENROAD_HIERARCHICAL`), so an SDC can bound
+  through it.
+- **SDC write-back**: the SDC a stage writes out after reading one
+  (`2_floorplan.sdc`, `3_place.sdc`); ORFS hands it to the next stage.
+  OpenSTA writes a hierarchical pin back as the leaf pins behind it, so
+  the copy decays as the resizer renames cells. The runner measures on the
+  SDC as given.
+- **Unmatched SDC pattern**: a pattern that names nothing in the netlist.
+  The constraint that used it is dropped, silently, at the first stage
+  that reads the SDC; the runner lists the patterns and counts the
+  dropped constraints (`sdc_unmatched`, `sdc_dropped`).
+- **Recovery / removal check**: the setup and hold checks of an
+  asynchronous reset: it must release early enough (recovery) and late
+  enough (removal) relative to the clock. A reset port with an IO budget
+  gets this check against every clock in the design.
+- **Reset ports**: inputs the runner leaves unconstrained (a false path,
+  `--reset-ports`, default `*rst*,*reset*`), since the contract is a
+  common reset window with the clocks stopped.
 
 ## Wires and area
 

@@ -28,6 +28,7 @@ the slang frontend because the generated RTL is SystemVerilog-2017 that the
 plain reader rejects.
 """
 import argparse
+import glob
 import json
 import os
 import re
@@ -62,6 +63,8 @@ METRICS = [
     (("cells", "utilization"),       "utilization",      "pct",   None),
     (("timing", "wns_ns"),           "WNS ns",           "float3", False),
     (("timing", "tns_ns"),           "TNS ns",           "float3", False),
+    (("timing", "reg2reg_wns_ns"),   "reg2reg WNS ns",   "float3", False),
+    (("timing", "reg2reg_tns_ns"),   "reg2reg TNS ns",   "float3", False),
     (("timing", "period_min_ns"),    "min period ns",    "float3", True),
     (("timing", "fmax_mhz"),         "Fmax MHz",         "float", False),
     (("critical_path", "cells"),     "path cells",       "int",   True),
@@ -184,9 +187,12 @@ def parse_design_spec(spec, top=None, name=None):
 # ----------------------------------------------------------------------
 # Constraints
 # ----------------------------------------------------------------------
-def sdc_text(design, clocks, period_ns, time_ns, user_sdc):
-    """The clocks at this run's period, the IO budget, then the design's own
-    SDC rewritten for this flow.
+def sdc_text(design, clocks, period_ns, time_ns, user_sdc, reset_globs=()):
+    """The clocks at this run's period, the IO budget (not on the reset
+    ports: those are false paths, since the contract is a common reset
+    window with the clocks stopped, and a budgeted reset fails its recovery
+    check against every other clock), then the design's own SDC rewritten
+    for this flow.
 
     A clock-crossing design ships an SDC that bounds its gray-pointer paths
     (noc_builder's `<base>.sdc`); it MUST be in, or STA times those paths
@@ -194,9 +200,13 @@ def sdc_text(design, clocks, period_ns, time_ns, user_sdc):
     Vivado and Synopsys, so three things are translated on the way in:
     `-datapath_only` (OpenSTA: `-ignore_clock_latency`), the `_reg` register
     suffix (a yosys flop is `<signal>[<bit>]$_DFF..._`, so the bit comes
-    before the suffix), and `/` hierarchy in cell names (the netlist is
-    flat, with `.` in the names). A `create_clock` on a port the runner
-    already clocks is dropped, so the period sweep wins."""
+    before the suffix), and `/` hierarchy in cell names: it stays `/` at a
+    module the RTL keeps (keep_hierarchy) and becomes `.` where yosys
+    flattened, so the pattern gets `?`, which matches either. Pins
+    (`get_pins {inst/sub/d[*]}`) need no translation: the kept modules'
+    pins exist, since OpenROAD links with the hierarchy. A `create_clock`
+    on a port the runner already clocks is dropped, so the period sweep
+    wins."""
     scale = 1.0 / time_ns
     lines = ["# written by pnr_runner", f"current_design {design.top}", ""]
     # the design's SDC names its clocks (`corenet` on port clk) and its clock
@@ -220,8 +230,15 @@ def sdc_text(design, clocks, period_ns, time_ns, user_sdc):
                   f"create_clock -name vclk_{name} -period {p:g}",
                   f"set_input_delay {0.2 * p:g} -clock vclk_{name} [all_inputs -no_clocks]",
                   f"set_output_delay {0.2 * p:g} -clock vclk_{name} [all_outputs]"]
+        if reset_globs:
+            lines += ["",
+                      "# reset ports: no budget, no recovery check (a common reset window,",
+                      "# clocks stopped); --reset-ports names them",
+                      f"set reset_ports [get_ports -quiet {{{' '.join(reset_globs)}}}]",
+                      "if { [llength $reset_ports] } { set_false_path -from $reset_ports }"]
     if user_sdc:
-        lines += ["", f"# {user_sdc}, rewritten for OpenSTA on a flat yosys netlist"]
+        lines += ["", f"# {user_sdc}, rewritten for OpenSTA on a yosys netlist (hierarchy kept",
+                  "# where the RTL says keep_hierarchy, flattened with '.' in the names elsewhere)"]
         clocked = {port for port, _ in clocks}
         for raw in open(user_sdc).read().splitlines():
             line = raw
@@ -234,7 +251,7 @@ def sdc_text(design, clocks, period_ns, time_ns, user_sdc):
                 line = "# (clocked by the runner) " + raw
             # inside get_cells {...}: hierarchy and the register suffix
             def cells(mm):
-                pat = mm.group(1).replace("/", ".")
+                pat = mm.group(1).replace("/", "?")
                 pat = pat.replace("$NOC_REG_SUFFIX[*][*]", "[*][*]$_*DFF*")
                 pat = pat.replace("$NOC_REG_SUFFIX[*]", "[*]$_*DFF*")
                 pat = pat.replace("$NOC_REG_SUFFIX", "$_*DFF*")
@@ -272,6 +289,10 @@ def config_text(design, pdk, sdc, util, jobs, seed, variables=()):
         f"export CORE_MARGIN = {PDK_CORE_MARGIN.get(pdk, 2)}",
         "export PLACE_DENSITY_LB_ADDON = 0.20",
         "export TNS_END_PERCENT = 100",
+        # the hierarchy the RTL asks to keep (keep_hierarchy, honoured by
+        # yosys) survives the OpenROAD link too, so an SDC can name a kept
+        # module's pins; a design yosys flattened fully is unaffected
+        "export OPENROAD_HIERARCHICAL = 1",
         # fixed seeds: two runs of one design print the same number
         "export SYNTH_REPEATABLE_BUILD = 1",
         f"export GPL_RANDOM_SEED = {seed}",
@@ -310,9 +331,14 @@ def other_setup_in(rundir, config, sdc):
         was, now = _config_vars(open(old).read()), _config_vars(config)
         differs += sorted(k for k in set(was) | set(now) if was.get(k) != now.get(k))
     old = os.path.join(rundir, "constraint.sdc")
-    if os.path.isfile(old) and open(old).read() != sdc:
+    if os.path.isfile(old) and _sdc_body(open(old).read()) != _sdc_body(sdc):
         differs.append("constraint.sdc")
     return ", ".join(differs) or None
+
+
+def _sdc_body(text):
+    """An SDC without its comments and blank lines: what OpenSTA reads."""
+    return [l.rstrip() for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
 
 
 def hint_on_failure(work, pdk, top):
@@ -438,18 +464,35 @@ def read_stage_json(path):
         return {}
 
 
-def unmatched_sdc_objects(log):
-    """OpenSTA warns `instance 'x' not found` for every SDC pattern that hits
-    nothing: a crossing bound that silently constrains nothing (the trap)."""
-    names = []
-    try:
+def unmatched_sdc_objects(logs_dir):
+    """The SDC patterns that hit nothing, and how many constraints were
+    dropped for it: a crossing bound that silently constrains nothing (the
+    trap). OpenSTA warns `pin 'x' not found` and then `no valid objects
+    specified for -through` at the one stage that reads the SDC as given
+    (ORFS copies it to 1_2_yosys.sdc and reads that in the synthesis step;
+    every later stage reads the previous stage's write-back, which has the
+    dropped constraints missing and its hierarchical pins expanded to leaf
+    pins, so its own `not found` lines are the resizer's renamed buffers,
+    not the user's patterns). Only the warnings that follow that read
+    count."""
+    names, dropped = [], 0
+    for log in sorted(glob.glob(os.path.join(logs_dir, "*.log"))):
+        reading = False
         for line in open(log, errors="ignore"):
-            m = re.search(r"STA-\d+\] (?:instance|net|pin|port|cell) '([^']+)' not found", line)
-            if m and m.group(1) not in names:
-                names.append(m.group(1))
-    except OSError:
-        pass
-    return names
+            if line.startswith("read_sdc "):
+                reading = line.rstrip().endswith("/1_2_yosys.sdc")
+                continue
+            if not reading:
+                continue
+            m = re.search(r"STA-\d+\] (?:instance|net|pin|port|cell|clock) '([^']+)' not found", line)
+            if m:
+                if m.group(1) not in names:
+                    names.append(m.group(1))
+            elif re.search(r"STA-\d+\] no valid objects specified for -(?:from|to|through)", line):
+                dropped += 1
+            elif not line.startswith("[WARNING"):
+                reading = False
+    return names, dropped
 
 
 # ----------------------------------------------------------------------
@@ -468,7 +511,7 @@ def place_and_time(args, design, period_ns, nets):
     make_log = os.path.join(rundir, "make.log")
     report_dir = os.path.join(rundir, "report")
 
-    sdc_new = sdc_text(design, args.clock, period_ns, time_ns, args.sdc)
+    sdc_new = sdc_text(design, args.clock, period_ns, time_ns, args.sdc, args.reset_ports)
     config_new = config_text(design, pdk, sdc, args.util, args.jobs, args.seed, args.var)
     # the same setup again is an incremental rerun (make skips what is
     # done); another setup must not land on a measured run's numbers, and
@@ -488,8 +531,9 @@ def place_and_time(args, design, period_ns, nets):
     print_message("info", f"{design.label}: {args.mode} on {pdk} at {period_ns:g} ns -> {rundir}")
     # ORFS's stages depend on the config and the SDC by mtime, so an
     # unchanged file is left alone and the rerun picks up where it stopped
-    for path, text in ((sdc, sdc_new), (config, config_new)):
-        if not (os.path.isfile(path) and open(path).read() == text):
+    for path, text, same in ((sdc, sdc_new, lambda a, b: _sdc_body(a) == _sdc_body(b)),
+                             (config, config_new, lambda a, b: a == b)):
+        if not (os.path.isfile(path) and same(open(path).read(), text)):
             with open(path, "w") as f:
                 f.write(text)
     open(make_log, "w").close()
@@ -522,11 +566,16 @@ def place_and_time(args, design, period_ns, nets):
                 "OBJECTS_DIR": objects, "REPORTS_DIR": reports})
     env.update({
         "PNR_ODB": "3_place.odb" if args.mode == "fast" else "6_final.odb",
-        "PNR_SDC": "3_place.sdc" if args.mode == "fast" else "6_final.sdc",
+        # the SDC as given, not the last stage's write-back: OpenSTA writes
+        # a bound through a kept module's pins back as the leaf pins of the
+        # moment, and the next stage's resizer renames those, so a copy
+        # handed down the flow loses crossing bounds bit by bit
+        "PNR_SDC": "pnr_runner.sdc",
         "PNR_MODE": args.mode,
         "PNR_NETS": " ".join(nets),
         "PNR_OUT": report_dir,
     })
+    shutil.copy(sdc, os.path.join(results, "pnr_runner.sdc"))
     sta_log = os.path.join(report_dir, "openroad.log")
     with open(sta_log, "w") as f:
         r = subprocess.run(["openroad", "-exit", "-no_splash",
@@ -565,6 +614,8 @@ def place_and_time(args, design, period_ns, nets):
         per_net[name] = {"hpwl_um": _float(hpwl), "pins": int(pins) if pins else None,
                          "routed_um": _float(routed)}
 
+    sdc_unmatched, sdc_dropped = unmatched_sdc_objects(logs)
+    r2r_wns, r2r_tns = _float(sta.get("reg2reg_wns_ui")), _float(sta.get("reg2reg_tns_ui"))
     metrics = {
         "design": design.name, "top": design.top, "pdk": pdk, "mode": args.mode,
         "period_ns": period_ns,
@@ -574,6 +625,9 @@ def place_and_time(args, design, period_ns, nets):
             "wns_ns": wns * S if wns is not None else None,
             "tns_ns": tns * S if tns is not None else None,
             "hold_wns_ns": (_float(sta.get("hold_wns")) or 0) * S,
+            "reg2reg_wns_ns": r2r_wns * time_ns if r2r_wns is not None else None,
+            "reg2reg_tns_ns": r2r_tns * time_ns if r2r_tns is not None else None,
+            "reg2reg_violators": int(sta["reg2reg_violators"]) if "reg2reg_violators" in sta else None,
             "period_min_ns": pmin,
             "fmax_mhz": 1000.0 / pmin if pmin else None,
             "period_min_by_clock_ns": pmins,
@@ -600,25 +654,26 @@ def place_and_time(args, design, period_ns, nets):
             "routed_wirelength_um": route.get("detailedroute__route__wirelength"),
         },
         "nets": per_net,
-        "sdc_unmatched": unmatched_sdc_objects(os.path.join(logs, "2_1_floorplan.log")),
+        "sdc_unmatched": sdc_unmatched,
+        "sdc_dropped": sdc_dropped,
         "run": {
             "rundir": rundir, "make_log": make_log, "sta_log": sta_log,
             "paths": os.path.join(report_dir, "paths.txt"),
             "orfs_logs": logs, "orfs_results": results,
             "flow_elapsed_s": round(flow_elapsed, 1),
             "files": design.files, "source": design.source, "sdc": sdc, "user_sdc": args.sdc,
-            "seed": args.seed, "vars": dict(args.var),
+            "reset_ports": args.reset_ports, "seed": args.seed, "vars": dict(args.var),
         },
     }
     with open(os.path.join(rundir, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
     with open(os.path.join(rundir, "report.txt"), "w") as f:
         f.write(render_single(metrics))
-    if metrics["sdc_unmatched"]:
-        print_message("warning", f"{len(metrics['sdc_unmatched'])} SDC object(s) matched "
-                                 f"nothing in the netlist, so they constrain nothing: "
-                                 f"{', '.join(metrics['sdc_unmatched'][:4])}"
-                                 f"{' ...' if len(metrics['sdc_unmatched']) > 4 else ''}")
+    if sdc_unmatched or sdc_dropped:
+        print_message("warning", f"{len(sdc_unmatched)} SDC pattern(s) matched nothing in the "
+                                 f"netlist and {sdc_dropped} constraint(s) were dropped for it: "
+                                 f"{', '.join(sdc_unmatched[:4])}"
+                                 f"{' ...' if len(sdc_unmatched) > 4 else ''}")
     print_message("info", f"METRICS: {rundir}/metrics.json")
     return metrics
 
@@ -653,8 +708,9 @@ def render_single(m):
             else:
                 routed = f", routed {n['routed_um']:.1f} um" if n.get("routed_um") else ""
                 out.append(f"  {name}: {n['pins']} pins, HPWL {n['hpwl_um']:.1f} um{routed}")
-    if m.get("sdc_unmatched"):
-        out += ["", "SDC objects that matched nothing (they constrain nothing):"]
+    if m.get("sdc_unmatched") or m.get("sdc_dropped"):
+        out += ["", f"SDC patterns that matched nothing ({m.get('sdc_dropped', 0)} constraint(s) "
+                    f"dropped for it, so they constrain nothing):"]
         out += [f"  {x}" for x in m["sdc_unmatched"]]
     out += ["", f"logs: {m['run']['make_log']}", f"      {m['run']['orfs_logs']}",
             f"path: {m['run']['paths']}"]
@@ -729,6 +785,9 @@ def main():
     p.add_argument("--pdk", choices=sorted(PDK_TIME_NS), default="nangate45")
     p.add_argument("--sdc", help="the design's own SDC (a clock-crossing design's <base>.sdc), "
                                  "rewritten for OpenSTA and sourced after the runner's clocks")
+    p.add_argument("--reset-ports", default="*rst*,*reset*", metavar="GLOB[,GLOB...]",
+                   help="input ports left unconstrained (false paths, no IO budget); "
+                        "'' to budget them like any input (default: *rst*,*reset*)")
     p.add_argument("--nets", default="", metavar="NET[,NET...]",
                    help="nets to measure one by one (flat netlist names, '.' for hierarchy)")
     p.add_argument("--nets-file", help="a file with one net name per line")
@@ -763,6 +822,7 @@ def main():
     if args.vs_name and not args.vs:
         p.error("--vs-name needs --vs")
 
+    args.reset_ports = [g for g in args.reset_ports.split(",") if g]
     clocks = []
     for c in args.clock or ["clk"]:
         port, _, per = c.partition("=")

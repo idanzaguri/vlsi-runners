@@ -30,11 +30,44 @@ puts $out "wns=[sta::worst_slack_cmd max]"
 puts $out "tns=[sta::total_negative_slack_cmd max]"
 puts $out "hold_wns=[sta::worst_slack_cmd min]"
 
-# the clock's minimum period: the worst register-to-register path, so the
-# period the design would close at, independent of where the constraint sits
+# the same between registers only. The ports' paths sit under the runner's
+# IO budget (one virtual clock at the primary period, which times a port of
+# another domain against the wrong clock), so they are noise; these are the
+# design's own numbers. In the library's time unit, unlike the two above.
+set r2r_from [all_registers -clock_pins]
+set r2r_to [all_registers -data_pins]
+set r2r [find_timing_paths -path_delay max -from $r2r_from -to $r2r_to \
+  -unique_paths_to_endpoint -slack_max 0 -group_path_count 1000000]
+set r2r_wns ""
+set r2r_tns 0.0
+foreach p $r2r {
+  set sl [get_property $p slack]
+  set r2r_tns [expr { $r2r_tns + $sl }]
+  if { $r2r_wns == "" || $sl < $r2r_wns } {
+    set r2r_wns $sl
+  }
+}
+if { $r2r_wns == "" } {
+  # nothing violates: the worst slack is the least positive one, one path
+  # per path group
+  foreach p [find_timing_paths -path_delay max -from $r2r_from -to $r2r_to \
+    -group_path_count 1] {
+    set sl [get_property $p slack]
+    if { $r2r_wns == "" || $sl < $r2r_wns } {
+      set r2r_wns $sl
+    }
+  }
+}
+puts $out "reg2reg_wns_ui=$r2r_wns"
+puts $out "reg2reg_tns_ui=$r2r_tns"
+puts $out "reg2reg_violators=[llength $r2r]"
+
+# the clock's minimum period: the worst register-to-register path (port
+# paths left out), so the period the design would close at, independent of
+# where the constraint sits
 foreach clk [all_clocks] {
   set name [get_name $clk]
-  if { [catch { set pmin [sta::find_clk_min_period $clk 1] } ] } {
+  if { [catch { set pmin [sta::find_clk_min_period $clk 0] } ] } {
     continue
   }
   if { $pmin > 0 } {

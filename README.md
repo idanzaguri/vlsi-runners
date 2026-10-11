@@ -84,7 +84,7 @@ module matters) and reports what placement knows:
 
 | group | what |
 |---|---|
-| timing | WNS, TNS, the minimum period (so Fmax), per clock |
+| timing | WNS and TNS, over everything and between registers; the minimum period (so Fmax), per clock |
 | critical path | start and end register, cells on it (this flow's logic depth), arrival, slack |
 | cells | count, flops, cell area, utilization |
 | wire | HPWL of every net summed and the longest one, ORFS's estimated length, and in `full` mode the routed length |
@@ -130,19 +130,46 @@ spots that failure in the log and prints the size and the `--var` to use.
 The RTL is read with yosys's **slang** frontend (`SYNTH_HDL_FRONTEND=slang`, with
 `SYNTHESIS` defined), since the generated SystemVerilog-2017 is beyond the plain
 reader. Seeds are fixed (`--seed`, default 42) and `SYNTH_REPEATABLE_BUILD` is on, so
-two runs of one design print the same numbers. A design that crosses clock domains
+two runs of one design print the same numbers.
+
+The port paths sit under the runner's IO budget, one virtual clock at the primary
+period with 20% of it on each side, which times a port of another clock domain against
+the wrong clock, so they are noise: the numbers to compare are the register-to-register
+ones (`reg2reg_wns_ns`, `reg2reg_tns_ns`, the critical path) and the minimum period,
+which leaves port paths out. A `set_input_delay` or `set_output_delay` in the design's
+own SDC replaces the runner's on that port, for a port that deserves a real constraint.
+
+A design that crosses clock domains
 must pass its own SDC with `--sdc`; it is sourced after the runner's clocks, with its
 Vivado spellings translated for OpenSTA (see the docstring of `sdc_text`), and any
-constraint that matched nothing in the netlist is listed in `metrics.json` under
-`sdc_unmatched` and warned about, since a bound on a missing cell constrains nothing.
-One caveat the runner does not hide: that SDC also declares the clocks asynchronous
-(`set_clock_groups -asynchronous`), and in OpenSTA, as in PrimeTime, clock groups take
-precedence over `set_max_delay`, so the bounded crossing paths are not timed at all;
-the bounds only act when the groups are removed, and then every crossing the bounds
-miss is timed clock-to-clock. Which of the two the measurement wants is the SDC
-author's call. Net names for `--nets` are the flat netlist's (`u_rd.rmask_q[15]`, as
-in `orfs/results/.../1_2_yosys.v` without the leading backslash). `--pdk asap7` runs
-the same flow on ASAP7 (its times are in ps; the runner converts); checked on one NI.
+pattern that matched nothing in the netlist is listed in `metrics.json` under
+`sdc_unmatched`, with the number of constraints dropped for it under `sdc_dropped`, and
+warned about, since a bound on a missing pin constrains nothing. (OpenSTA says so once,
+at the first stage that reads the SDC, which in ORFS is synthesis; that stage writes the
+SDC back without the dropped constraints, so no later log mentions them.) Reset ports
+(`--reset-ports`, default `*rst*,*reset*`) get no IO budget and are false paths: the
+contract is a common reset window with the clocks stopped, and a budgeted reset fails
+its recovery check against every other clock and takes over WNS.
+
+The hierarchy the RTL asks to keep (`keep_hierarchy` on the crossing and synchronizer
+modules) survives yosys and, since the runner links with `OPENROAD_HIERARCHICAL`,
+OpenROAD too, so the SDC can bound through a kept module's pins
+(`get_pins {u_x_cdc/u_wsync/d[*]}`) exactly as it does under Design Compiler or Vivado;
+a design yosys flattens fully prints the same numbers either way (checked on the
+butterfly). One thing to know: ORFS hands the SDC from stage to stage as OpenSTA writes
+it back, and that copy has such pins expanded to the leaf pins of the moment, which the
+next stage's resizer renames, so a bound handed down the flow loses bits on the way.
+The runner therefore measures on the SDC as given (`pnr_runner.sdc` in the results),
+never on the last stage's copy; the optimization steps inside ORFS still see the copies.
+A caveat the runner does not hide: an SDC that declares the clocks asynchronous
+(`set_clock_groups -asynchronous`) silences its own `set_max_delay` bounds, in OpenSTA
+as in PrimeTime, since clock groups take precedence; without the groups every crossing
+the bounds miss is timed clock-to-clock, and clocks with no common period are warned
+about. Which of the two the measurement wants is the SDC author's call. Net names for
+`--nets` are the netlist's: `u_rd.rmask_q[15]` where yosys flattened (as in
+`orfs/results/.../1_2_yosys.v` without the leading backslash), `u_x_cdc/wbin[3]` inside
+a kept module. `--pdk asap7` runs the same flow on ASAP7 (its times are in ps; the
+runner converts); checked on one NI.
 
 The toolchain is the ORFS checkout at `/src/tools/OpenROAD-flow-scripts` (or
 `$ORFS_HOME`, or `--orfs`): see [docs/install-openroad.md](docs/install-openroad.md).
