@@ -17,33 +17,191 @@ from log_utils import *
 import datetime
 from pathlib import Path
 from tqdm import tqdm
+from test_runner import (ms_sim_passed, ms_sim_warn, ms_sim_fail, ms_sim_waive,
+                         vcs_sim_passed, vcs_sim_warn, vcs_sim_fail, vcs_sim_waive)
 
 
-def _timed_out_but_finished_cleanly(text, expect_fail=None):
-    """A common Modelsim/Questa flake: $finish runs and the UVM report shows
-    a clean pass, but the simulator process then hangs (e.g., license-server
-    drop, "Read failure in vlm process") and gets killed by the wall-clock
-    timeout. The test logically passed -- recognize it so it doesn't show up
-    as a real failure.
+# ----------------------------------------------------------------------
+# A simulator that stops answering.
+#
+# Questa's vsim front end (vish) runs the simulation kernel (vsimk) and a
+# license process (vlm, which runs salt_mgls_asynch). vlm moves itself into
+# a process group of its own. So a kill of the test's process group missed
+# it: vlm noticed its vsim was gone, printed "** Fatal: Read failure in vlm
+# process (0,0)" and exited. Every test the runner killed at its timeout
+# therefore ended in that line, which made the license look like the cause
+# of the hang it only reported (checked on Questa FSE 2025.2: a process
+# group kill of a running vsim prints exactly that line, nothing else does).
+#
+# What the runner does now: it watches the output while the test runs. A
+# test whose simulator lives on --finish_grace seconds after $finish is
+# killed and judged from its output; a test lost before $finish (killed at
+# --timeout, or its license process failed) is rerun with the same seed
+# (--reruns). Every kill takes the test's whole session, license processes
+# included, and writes what each process was doing into the test's log.
+# ----------------------------------------------------------------------
 
-    The proof is the UVM report summary printed before $finish, with zero
-    UVM_ERROR and UVM_FATAL, and no simulator error before $finish. A test
-    that declares expect_fail never counts: its verdict needs the failure it
-    expects, which a clean summary says did not happen."""
+# The line a simulator prints when $finish runs: Questa's "** Note: $finish
+# : <file>(<line>)", VCS's "$finish called from file ...". Questa flushes
+# its output when the run stops, so the runner reads this line while vsim
+# still lives.
+_FINISH_RE = re.compile(r"\*\* Note: \$finish\b|\$finish called from")
+
+# What Questa prints when its license machinery fails: vlm itself when it
+# loses the pipe to its vsim ("Read failure in vlm process", "Write failure
+# in vlm process"), and the vsim front end when vlm dies under it ("FATAL
+# ERROR in license manager", exit code 43) or a periodic check fails
+# ("license lost").
+_LICENSE_FAIL_RE = re.compile(r"(Read|Write) failure in vlm process|FATAL ERROR in license manager"
+                              r"|[Ll]icense lost|Unable to kill and restart license")
+
+# test_runner's own rules for a simulation log, per simulator
+_SIM_LOG_RULES = {
+    "modelsim": (ms_sim_passed, ms_sim_warn, ms_sim_fail, ms_sim_waive),
+    "vcs": (vcs_sim_passed, vcs_sim_warn, vcs_sim_fail, vcs_sim_waive),
+}
+
+
+def _head_before_finish(stdout):
+    """The output before the simulator's $finish line, or None when the run
+    never reached $finish."""
+    m = _FINISH_RE.search(stdout)
+    return stdout[:m.start()] if m else None
+
+
+def _verdict_from_output(head, simulator="modelsim", expect_fail=None):
+    """The verdict test_runner would have given a run whose exit code is
+    lost, read from the simulator's output up to $finish (``head``).
+
+    A run loses it when its simulator lives on after $finish and the runner
+    kills it, or when Questa's license process fails after $finish and vsim
+    exits on that. The test had finished, so its own output decides, by
+    test_runner's rules for a simulation log: the UVM report summary must be
+    there; a UVM error or fatal, or a simulator error, fails it; a UVM
+    warning, or a simulator warning that is not waived, makes it
+    PASSED_WARN. The summary's counts must read UVM_ERROR : 0 and
+    UVM_FATAL : 0, and a UVM_WARNING count above 0 makes it PASSED_WARN,
+    which --pedant fails as it fails test_runner's exit code 2. A simulator
+    Fatal before $finish fails it. A test that declares expect_fail passes
+    only when the output failed and carries its text, as in test_runner."""
+    passed, warn, fail, waive = _SIM_LOG_RULES.get(simulator, _SIM_LOG_RULES["modelsim"])
+    status = scan_log_lines(head.splitlines(), passed, warn, fail, waive)[0]
+    if status in ("PASSED", "PASSED_WARN"):
+        if not (re.search(r"UVM_ERROR\s*:\s*0\b", head) and re.search(r"UVM_FATAL\s*:\s*0\b", head)):
+            status = "FAILED"
+        elif re.search(r"^#? ?\*\* Fatal", head, re.M):
+            status = "FAILED"
+        elif re.search(r"UVM_WARNING\s*:\s*[1-9]", head):
+            status = "PASSED_WARN"
     if expect_fail:
-        return False
-    head, sep, _tail = text.partition("$finish")
-    if not sep:
-        return False
-    if "UVM Report Summary" not in head:
-        return False
-    if not re.search(r"UVM_ERROR\s*:\s*0\b", head):
-        return False
-    if not re.search(r"UVM_FATAL\s*:\s*0\b", head):
-        return False
-    if re.search(r"^#? ?\*\* (Error|Fatal)", head, re.M):
-        return False
-    return True
+        failed = status not in ("PASSED", "PASSED_WARN")
+        return "PASSED" if failed and expect_fail in head else "FAILED"
+    return status if status in ("PASSED", "PASSED_WARN") else "FAILED"
+
+
+def _session_members(sid):
+    """{pid: (ppid, pgid, state)} of every live process in session ``sid``.
+
+    Each test runs in a session of its own (start_new_session), so its
+    session holds everything it started, the license processes too, which
+    leave the test's process group but cannot leave its session."""
+    members = {}
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return members
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as f:
+                # after the "(command)": state ppid pgrp session ...
+                fields = f.read().rpartition(")")[2].split()
+        except OSError:
+            continue
+        if len(fields) > 3 and fields[3] == str(sid) and fields[0] != "Z":
+            members[int(entry)] = (int(fields[1]), int(fields[2]), fields[0])
+    return members
+
+
+def _signal_session(sid, sig):
+    """Send ``sig`` to every process of a test's session, the processes
+    outside the test's own process group (the license processes) first, so
+    none of them outlives its vsim. Returns how many there were."""
+    members = _session_members(sid)
+    for pid in sorted(members, key=lambda p: members[p][1] == sid):
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass
+    try:
+        os.killpg(sid, sig)  # anything forked since the listing
+    except OSError:
+        pass
+    return len(members)
+
+
+def _kill_session(sid):
+    """SIGKILL a test's whole session until nothing of it is left."""
+    for _ in range(50):
+        if not _signal_session(sid, signal.SIGKILL):
+            return
+        time.sleep(0.1)
+
+
+def _session_snapshot(sid):
+    """What each process of a test's session was doing: state, CPU seconds
+    used so far, the kernel function it waits in (WCHAN), its command. The
+    runner writes it into the log of a test it kills, so the next hang
+    names the process that stopped, and a stuck simulator (asleep, its CPU
+    time flat) can be told from a busy one."""
+    tick = os.sysconf("SC_CLK_TCK")
+    rows = [f"{'PID':>8} {'PPID':>8} {'PGID':>8} ST {'CPU_S':>8}  {'WCHAN':<24} COMMAND"]
+    for pid, (ppid, pgid, state) in sorted(_session_members(sid).items()):
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                fields = f.read().rpartition(")")[2].split()
+            cpu = (int(fields[11]) + int(fields[12])) / tick  # utime + stime
+            with open(f"/proc/{pid}/wchan") as f:
+                # "0" while running; drop the compiler's ".constprop.0" suffixes
+                wchan = f.read().strip().split(".")[0]
+            wchan = wchan if wchan not in ("", "0") else "-"
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmd = f.read().replace(b"\0", b" ").decode(errors="replace").strip()
+        except (OSError, ValueError, IndexError):
+            continue
+        rows.append(f"{pid:>8} {ppid:>8} {pgid:>8} {state:>2} {cpu:8.1f}  {wchan[:24]:<24} {cmd[:110]}")
+    return rows
+
+
+class _Output:
+    """A test's stdout and stderr, read as they arrive by two threads, so
+    the runner sees the simulator's $finish line while the simulator still
+    runs."""
+
+    def __init__(self, proc):
+        self.out, self.err = [], []
+        self.finish_at = None  # when the $finish line arrived
+        self._threads = [threading.Thread(target=self._pump, args=(proc.stdout, self.out, True), daemon=True),
+                         threading.Thread(target=self._pump, args=(proc.stderr, self.err, False), daemon=True)]
+        for t in self._threads:
+            t.start()
+
+    def _pump(self, stream, sink, watch):
+        for line in iter(stream.readline, ""):
+            sink.append(line)
+            if watch and self.finish_at is None and _FINISH_RE.search(line):
+                self.finish_at = time.time()
+        stream.close()
+
+    def closed(self, timeout):
+        """Wait up to ``timeout`` seconds for both pipes to reach their end;
+        True when they did."""
+        end = time.time() + timeout
+        for t in self._threads:
+            t.join(max(0.0, end - time.time()))
+        return not any(t.is_alive() for t in self._threads)
+
 
 global wa_root
 
@@ -54,25 +212,21 @@ _running_procs = {}
 _running_procs_lock = threading.Lock()
 _abort_event = threading.Event()  # set on interrupt; stops new tests from launching
 test_timeout = 300  # per-test wall-clock timeout in seconds (see --timeout)
+finish_grace = 60   # seconds a simulator may live on after $finish (see --finish_grace)
 
 
 def _terminate_running_procs(grace=2):
-    """Kill every in-flight test process group (test_runner + its vlog/vsim children).
-    Each test is launched in its own process group, so killpg reaches the whole tree."""
+    """Kill every in-flight test (test_runner, its vlog/vsim children and
+    the license processes). Each test runs in a session of its own, so the
+    session reaches the whole tree."""
     with _running_procs_lock:
         _abort_event.set()  # block any not-yet-launched worker from spawning a new test
         procs = list(_running_procs.values())
     for proc in procs:
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except OSError:
-            pass
+        _signal_session(proc.pid, signal.SIGTERM)
     time.sleep(grace)  # give them a chance to exit cleanly...
     for proc in procs:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)  # ...then force-kill any stragglers
-        except OSError:
-            pass
+        _kill_session(proc.pid)  # ...then force-kill any stragglers
     return len(procs)
 
 
@@ -82,7 +236,14 @@ def run_test(block, test, seed, rundir, codecov=False, simulator="modelsim",
 
     ``lib`` is a work library built once for this test's DESIGN (see
     :func:`build_libs`): the test then compiles nothing and optimizes
-    nothing, it just runs the snapshot already in there."""
+    nothing, it just runs the snapshot already in there.
+
+    Returns (block, test, seed, status, seconds, note). The status is
+    PASSED, PASSED_WARN or FAILED, or LOST: the simulator stopped before
+    $finish for a reason that is not the test's (the runner killed it at
+    the timeout, or its license process failed), and the caller reruns it.
+    ``note`` says, in a few words, what the runner did beyond reading
+    test_runner's exit code, or is None."""
     cmd = f"python3 {_TEST_RUNNER} --block {block} --test {test} --seed {seed} --rundir {rundir} --simulator {simulator}"
     if lib:
         cmd += f" --run-only --lib {lib}"
@@ -93,57 +254,98 @@ def run_test(block, test, seed, rundir, codecov=False, simulator="modelsim",
     # Register under the lock and bail out if an abort is already in progress, so a
     # worker that hasn't launched yet won't spawn an unkillable process after the
     # interrupt handler has already swept _running_procs.
-    # start_new_session=True puts this test (and its vlog/vsim children) in its own
-    # process group so the Ctrl-C handler can kill the whole tree via os.killpg.
+    # start_new_session=True puts this test (and everything it starts) in a
+    # session of its own, which is what a kill of the test takes.
     t_start = time.time()
     with _running_procs_lock:
         if _abort_event.is_set():
-            return block, test, seed, "FAILED", 0.0
+            return block, test, seed, "FAILED", 0.0, None
         proc = subprocess.Popen(cmd_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, start_new_session=True)
+                                text=True, errors="replace", start_new_session=True)
         _running_procs[proc.pid] = proc
-    timed_out = False
+    output = _Output(proc)
+    killed, snapshot = None, []
     try:
-        stdout, stderr = proc.communicate(timeout=test_timeout)
-    except subprocess.TimeoutExpired:
-        # A test that won't finish (e.g. vsim hanging after $finish) must not stall the
-        # whole regression. Kill its process group and mark it FAILED.
-        timed_out = True
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except OSError:
-            pass
-        stdout, stderr = proc.communicate()  # reap after the kill
+        while True:
+            try:
+                proc.wait(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            now = time.time()
+            if finish_grace and output.finish_at is not None and now - output.finish_at >= finish_grace:
+                killed = "after_finish"
+            elif now - t_start >= test_timeout:
+                killed = "timeout"
+            if killed:
+                snapshot = _session_snapshot(proc.pid)
+                _kill_session(proc.pid)
+                proc.wait()
+                break
+        # the pipes reach their end once every process holding them is gone:
+        # a license process outlives its vsim by a moment, and one that hangs
+        # must not hang the runner with it
+        if not output.closed(30):
+            _kill_session(proc.pid)
+            output.closed(10)
     finally:
         with _running_procs_lock:
             _running_procs.pop(proc.pid, None)
 
-    log_text = (stdout or "") + "\n" + (stderr or "")
-    # When the timeout fires after $finish (common Modelsim license/post-finish
-    # flake), the UVM summary in the captured log already shows a clean pass.
-    clean_finish_after_timeout = timed_out and _timed_out_but_finished_cleanly(
-        log_text, expect_fail_of(block, test))
-
-    log_path = os.path.join(rundir, "test.log")
-    with open(log_path, "w") as log_file:
-        log_file.write(log_text)
-        if timed_out:
-            log_file.write(f"\n[regr_runner] TIMEOUT: test killed after {test_timeout}s\n")
-            if clean_finish_after_timeout:
-                log_file.write("[regr_runner] UVM summary shows clean pass before timeout -- treating as PASSED.\n")
-
-    if timed_out:
-        status = "PASSED" if clean_finish_after_timeout else "FAILED"
+    stdout, stderr = "".join(output.out), "".join(output.err)
+    log_text = stdout + "\n" + stderr
+    head = _head_before_finish(stdout)
+    expect = expect_fail_of(block, test)
+    notes, note = [], None
+    if killed:
+        if killed == "timeout":
+            notes.append(f"TIMEOUT: test killed after {test_timeout}s")
+            note = f"killed at the {test_timeout}s timeout"
+        else:
+            notes.append(f"HUNG AFTER $finish: the simulator was still running "
+                         f"{finish_grace}s after $finish, killed")
+            note = f"killed {finish_grace}s after $finish"
+        if head is not None:
+            status = _verdict_from_output(head, simulator, expect)
+            notes.append(f"the test had reached $finish, so its output up to there "
+                         f"decides: {status}")
+        else:
+            status = "LOST"
+            note += " before $finish"
+            notes.append("the simulator never reached $finish")
     elif proc.returncode == 0:
         status = "PASSED"
     elif proc.returncode == 2:
         status = "PASSED_WARN"
+    elif _LICENSE_FAIL_RE.search(log_text):
+        if head is not None:
+            status = _verdict_from_output(head, simulator, expect)
+            note = "its license process failed after $finish"
+            notes.append(f"the simulator's license process failed after $finish (test_runner "
+                         f"exit code {proc.returncode}), so the output up to $finish decides: {status}")
+        else:
+            status = "LOST"
+            note = "its license process failed before $finish"
+            notes.append(f"the simulator's license process failed before $finish (test_runner "
+                         f"exit code {proc.returncode})")
     else:
         status = "FAILED"
-    return block, test, seed, status, time.time() - t_start
+    if killed and head is not None and codecov and not os.path.exists(os.path.join(rundir, "coverage.ucdb")):
+        notes.append("no coverage database: the simulator was killed before it saved one")
+        note += ", no coverage database"
+    if snapshot:
+        notes.append("its processes when killed:")
+        notes.extend(f"    {row}" for row in snapshot)
+
+    log_path = os.path.join(rundir, "test.log")
+    with open(log_path, "w") as log_file:
+        log_file.write(log_text)
+        if notes:
+            log_file.write("\n" + "".join(f"[regr_runner] {n}\n" for n in notes))
+    return block, test, seed, status, time.time() - t_start, note
 
 
-def clean_test_files(rundir, success, keep_patterns = ["test.log", "coverage.ucdb"]):
+def clean_test_files(rundir, success, keep_patterns = ["test.log", "test.try*.log", "coverage.ucdb"]):
     rundir = Path(rundir)  # Ensure rundir is a Path object.
     if not rundir.is_dir():
         raise ValueError(f"{rundir} is not a valid directory.")
@@ -238,8 +440,14 @@ def parse_test_list(file_path):
     
     return content.get("tests", [])
 
-def summarize_results(results, summary_path, total_tests, start_time, pedant=False):
-    """Generates a summary of all test results."""
+def summarize_results(results, summary_path, total_tests, start_time, pedant=False, reruns=()):
+    """Generates a summary of all test results.
+
+    ``results`` holds (block, test, seed, status, log, seconds, note): the
+    note is set when the verdict came from the test's output and not from
+    test_runner's exit code (the simulator was killed, or lost its license,
+    after $finish). ``reruns`` holds (block, test, seed, why, seconds, log)
+    for every run lost before $finish and run again with the same seed."""
     def line(t):
         # test, seed, log, and the member's wall time (compile is per design,
         # so this is the vsim run plus the runner's own overhead)
@@ -248,6 +456,12 @@ def summarize_results(results, summary_path, total_tests, start_time, pedant=Fal
     passed      = [line(t) for t in results if t[3] == "PASSED"]
     passed_warn = [line(t) for t in results if t[3] == "PASSED_WARN"]
     failed      = [line(t) for t in results if t[3] == "FAILED"]
+    judged      = [f"{t[1]} (seed {t[2]}) {t[3]}: {t[6]}, {t[4]}"
+                   for t in results if len(t) > 6 and t[6]]
+    final = {(t[0], t[1], t[2]): t[3] for t in results}
+    rerun_lines = [f"{test} (seed {seed}) {why}, {secs:.1f}s, {log}; "
+                   f"rerun: {final.get((block, test, seed), 'running')}"
+                   for block, test, seed, why, secs, log in reruns]
     slowest = sorted(results, key=lambda t: -(t[5] if len(t) > 5 else 0.0))[:10]
     duration = time.time() - start_time
 
@@ -262,6 +476,8 @@ def summarize_results(results, summary_path, total_tests, start_time, pedant=Fal
         f"Passed: {len(passed)} ({len(passed)/total_tests:.1%})\n"
         f"Passed with warnings: {len(passed_warn)} ({len(passed_warn)/total_tests:.1%})\n"
         f"Failed: {len(failed)} ({len(failed)/total_tests:.1%})\n"
+        f"Reruns: {len(rerun_lines)} (lost before $finish, run again with the same seed)\n"
+        f"Judged from the output: {len(judged)} (killed or lost its license after $finish)\n"
         f"Pedant mode: {pedant} (warnings treated as {'failures' if pedant else 'passes'})\n"
         f"Effective pass rate: {effective_passed/total_tests:.1%}\n"
         f"Duration: {duration:.2f} seconds\n"
@@ -273,6 +489,10 @@ def summarize_results(results, summary_path, total_tests, start_time, pedant=Fal
         f"Passed with Warnings:\n" + "\n".join(passed_warn) + "\n"
         f"{'-'*40}\n"
         f"Failed Tests:\n" + "\n".join(failed) + "\n"
+        f"{'-'*40}\n"
+        f"Reruns:\n" + "\n".join(rerun_lines) + "\n"
+        f"{'-'*40}\n"
+        f"Judged from the output:\n" + "\n".join(judged) + "\n"
     )
 
     with open(summary_path, "w") as summary_file:
@@ -379,7 +599,9 @@ def main():
                         "member and merge it per block (see test_runner --codecov)")
     parser.add_argument("--keep", action="store_true", help="Disable passesd tests files folders cleaning")
     parser.add_argument("--pedant", action="store_true", help="Treat tests that pass with warnings as failures (affects pass rate and stop_on_fail)")
-    parser.add_argument("--timeout", type=int, default=300, help="Per-test wall-clock timeout in seconds; a test exceeding it is killed and marked FAILED (default: 300)")
+    parser.add_argument("--timeout", type=int, default=300, help="Per-test wall-clock timeout in seconds; a test exceeding it is killed. One that had reached $finish is judged from its output, one that had not is rerun (see --reruns) and then FAILED (default: 300)")
+    parser.add_argument("--finish_grace", type=int, default=60, help="Seconds a simulator may keep running after $finish (coverage save, quit) before it is killed and the test judged from its output; 0 waits for --timeout instead (default: 60)")
+    parser.add_argument("--reruns", type=int, default=1, help="How many times a test whose simulator stopped before $finish for a reason that is not the test's (killed at --timeout, or its license process failed) is rerun with the same seed before it counts as FAILED; 0 never reruns (default: 1)")
     parser.add_argument("--simulator", type=str, choices=["modelsim", "vcs"], default="modelsim", help="Simulator to use for every test in the regression (default: modelsim)")
     parser.add_argument("--no-shared-lib", action="store_true", help="Compile and optimize inside every test, as before the shared design libraries (slower; use if a library build is in the way)")
     args = parser.parse_args()
@@ -404,8 +626,9 @@ def main():
     print(f"{BOLD_CYAN}{ascii_art}{RESET}")
 
 
-    global wa_root, test_timeout
+    global wa_root, test_timeout, finish_grace
     test_timeout = args.timeout
+    finish_grace = args.finish_grace
     wa_root = get_git_root()
     if not wa_root:
         print_message("error","You are not inside valid workarea.")
@@ -446,7 +669,7 @@ def main():
             unique_seeds = random.sample(range(0, 999999), entry["repetitions"])
         for seed in unique_seeds:
             rundir = regression_dir / block / test / f"seed_{seed}"
-            test_queue.append((block, test, seed, rundir))
+            test_queue.append((block, test, seed, rundir, 1))
     random.shuffle(test_queue)
 
     # Build each DESIGN once (Idan, 2026-09-16). Questa optimizes the design
@@ -456,7 +679,7 @@ def main():
     libs, build_failed = {}, set()
     if args.simulator == "modelsim" and not args.no_shared_lib:
         wanted = {}
-        for block, test, _seed, _rundir in test_queue:
+        for block, test, _seed, _rundir, _attempt in test_queue:
             comp = comp_of_tests(block).get(test)
             if comp:
                 wanted.setdefault((block, comp), test)
@@ -485,7 +708,8 @@ def main():
     for block, tests in grouped_tests.items():
         print_block_table(block, tests)
     
-    status = lambda: f"Total: {total_tests}, Running: {running_tests}, Passed: {passed_tests}, Warned: {passed_warn_tests}, Failed: {failed_tests}, Pending: {pending_tests}"
+    reruns = []  # (block, test, seed, why, seconds, kept log) of every rerun
+    status = lambda: f"Total: {total_tests}, Running: {running_tests}, Passed: {passed_tests}, Warned: {passed_warn_tests}, Failed: {failed_tests}, Pending: {pending_tests}, Reruns: {len(reruns)}"
     pbar = tqdm(total = total_tests, bar_format='{l_bar}{bar} | Elapsed: {elapsed} | ETA: {remaining}')
 
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.max_parallel)
@@ -496,14 +720,14 @@ def main():
         while test_queue or futures:
             
             while test_queue and len(futures) < args.max_parallel:
-                block, test, seed, rundir = test_queue.pop(0)
+                block, test, seed, rundir, attempt = test_queue.pop(0)
                 rundir.mkdir(parents=True, exist_ok=True)
                 pending_tests -= 1
                 running_tests += 1
                 lib = libs.get((block, comp_of_tests(block).get(test)))
                 future = executor.submit(run_test, block, test, seed, rundir,
                                          args.codecov, args.simulator, lib)
-                futures[future] = (block, test, seed, rundir)
+                futures[future] = (block, test, seed, rundir, attempt)
                 pbar.set_description(status())
                 pbar.update(0)
             
@@ -512,24 +736,54 @@ def main():
                 return_when=concurrent.futures.FIRST_COMPLETED)
             
             for future in done:
-                block, test, seed, rundir = futures.pop(future)
-                test_status, elapsed = future.result()[3:5]
+                block, test, seed, rundir, attempt = futures.pop(future)
+                test_status, elapsed, note = future.result()[3:6]
                 test_log = rundir / "test.log"
-                results.append((block, test, seed, test_status, test_log, elapsed))
+                running_tests -= 1
+                if test_status == "LOST":
+                    # the simulator stopped before $finish for a reason that is
+                    # not the test's: the same seed again, the lost run's log
+                    # kept beside the rerun's
+                    if attempt <= args.reruns:
+                        kept = rundir / f"test.try{attempt}.log"
+                        try:
+                            with open(test_log, "a") as f:
+                                f.write(f"[regr_runner] rerun {attempt} of {args.reruns}, same seed; "
+                                        f"this log is kept as {kept.name}\n")
+                            os.replace(test_log, kept)
+                        except OSError:
+                            pass
+                        reruns.append((block, test, seed, note, elapsed, kept))
+                        test_queue.insert(0, (block, test, seed, rundir, attempt + 1))
+                        pending_tests += 1
+                        tqdm.write(f"{test} @ {seed} {MAGENTA}lost{RESET} ({note}), rerunning with the same seed")
+                        summarize_results(results, regression_dir / "summary.txt", total_tests, start_time,
+                                          args.pedant, reruns)
+                        pbar.set_description(status())
+                        continue
+                    try:
+                        with open(test_log, "a") as f:
+                            f.write(f"[regr_runner] lost before $finish on its "
+                                    f"{'rerun' if attempt > 1 else 'only run (--reruns 0)'}: FAILED\n")
+                    except OSError:
+                        pass
+                    test_status, note = "FAILED", None
+                results.append((block, test, seed, test_status, test_log, elapsed, note))
                 if not args.keep:
                     clean_test_files(rundir, test_status != "FAILED")
-                running_tests -= 1
 
+                how = f" ({note})" if note else ""
                 if test_status == "PASSED":
                     passed_tests += 1
-                    tqdm.write(f"{test} @ {seed} {GREEN}passed{RESET}")
+                    tqdm.write(f"{test} @ {seed} {GREEN}passed{RESET}{how}")
                 elif test_status == "PASSED_WARN":
                     passed_warn_tests += 1
-                    tqdm.write(f"{test} @ {seed} {YELLOW}passed with warnings{RESET}")
+                    tqdm.write(f"{test} @ {seed} {YELLOW}passed with warnings{RESET}{how}")
                 else:
                     failed_tests += 1
-                    tqdm.write(f"{test} @ {seed} {RED}failed{RESET}")
-                summarize_results(results, regression_dir / "summary.txt", total_tests, start_time, args.pedant)
+                    tqdm.write(f"{test} @ {seed} {RED}failed{RESET}{how}")
+                summarize_results(results, regression_dir / "summary.txt", total_tests, start_time,
+                                  args.pedant, reruns)
                 pbar.set_description(status())
                 pbar.update(1)
 
@@ -552,29 +806,32 @@ def main():
         cancelled = list(test_queue)         # tests still queued, never started
 
         print(f"\n{MAGENTA}Stopped (running when interrupted): {len(stopped)}{RESET}")
-        for _block, _test, _seed, _rundir in stopped:
+        for _block, _test, _seed, _rundir, _attempt in stopped:
             print(f"  {MAGENTA}{_test} @ {_seed}{RESET}")
 
         print(f"\n{GRAY}Cancelled (never started): {len(cancelled)}{RESET}")
-        for _block, _test, _seed, _rundir in cancelled:
+        for _block, _test, _seed, _rundir, _attempt in cancelled:
             print(f"  {GRAY}{_test} @ {_seed}{RESET}")
 
         print(f"\nCompleted before interrupt: {GREEN}{passed_tests} passed{RESET}, "
               f"{YELLOW}{passed_warn_tests} warned{RESET}, {RED}{failed_tests} failed{RESET}")
 
-        # Kill the in-flight simulations (test_runner + its vlog/vsim children).
+        # Kill the in-flight simulations (test_runner, its vlog/vsim children
+        # and their license processes).
         print_message("warning", f"Stopping {len(stopped)} running simulation(s)...")
         killed = _terminate_running_procs()
         print_message("info", f"Stopped {killed} simulation(s).")
 
-        summarize_results(results, regression_dir / "summary.txt", total_tests, start_time, args.pedant)
+        summarize_results(results, regression_dir / "summary.txt", total_tests, start_time,
+                          args.pedant, reruns)
         print_message("info", f"Partial report: {regression_dir}/summary.txt")
         executor.shutdown(wait=False, cancel_futures=True)
         sys.stdout.flush()
         sys.exit(130)
 
     executor.shutdown(wait=False, cancel_futures=True)
-    summarize_results(results, regression_dir / "summary.txt", total_tests, start_time, args.pedant)
+    summarize_results(results, regression_dir / "summary.txt", total_tests, start_time,
+                      args.pedant, reruns)
 
     pbar.close() 
     print()

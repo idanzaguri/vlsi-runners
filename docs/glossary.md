@@ -34,6 +34,40 @@ runner reports them so two forms of one design can be compared.
 - **Snapshot / optimized design**: the `vopt` output that `vsim` runs
   without optimizing again (`<top>_opt`).
 
+## Regressions and simulator hangs (Questa)
+
+- **$finish**: the SystemVerilog call that ends a simulation. UVM makes it
+  after the report summary; Questa prints `** Note: $finish` when it runs.
+- **PASSED_WARN**: a test that passed with a UVM or simulator warning
+  (test_runner's exit code 2). `--pedant` counts it as a failure.
+- **Timeout** (`--timeout`): the wall-clock seconds a test may take before
+  the runner kills it.
+- **Grace after $finish** (`--finish_grace`): how long a simulator may
+  keep running after `$finish` (coverage save, quit) before the runner
+  kills it and judges the test from its output. Default 60 s; 0 waits for
+  the timeout instead.
+- **Judged from the output**: a verdict read from the test's own output up
+  to `$finish`, by test_runner's log rules, when test_runner's exit code was
+  lost to a kill or to a license failure after `$finish`.
+- **Lost run**: a run whose simulator stopped before `$finish` for a reason
+  that is not the test's: killed at the timeout, or its license process
+  failed. It is not a failure until its rerun fails too.
+- **Rerun** (`--reruns`): a lost run starts again with the same seed. Its
+  log stays as `test.try1.log` beside the rerun's `test.log`. Default 1;
+  0 never reruns.
+- **vish, vsimk**: the two processes of a running `vsim`, the front end
+  that reads commands and the simulation kernel.
+- **vlm, salt_mgls_asynch**: Questa's license process, one per `vsim`, and
+  the helper it runs for the periodic license check.
+- **Read failure in vlm process**: what `vlm` prints when its `vsim`
+  disappears. In a log from before the runner killed whole sessions, it
+  marks a test the runner killed at its timeout.
+- **Session, process group**: the runner starts each test in a session of
+  its own and kills the whole session. `vlm` leaves the test's process group
+  but not its session.
+- **WCHAN**: the kernel function a sleeping process waits in, from
+  `/proc/<pid>/wchan`. A killed test's log lists it for each process.
+
 ## From RTL to a placed chip
 
 - **RTL**: the SystemVerilog you write (registers and the logic between

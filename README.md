@@ -74,6 +74,36 @@ cell count (`stat`) and critical-path logic depth (`ltp`). `--vs <block>[:<top>]
 synthesizes a second design and prints a delta table; each run also drops a
 `metrics.json` under `metrics/<block>/<top>/`.
 
+### A simulator that hangs (`regr_runner`, Questa)
+
+A Questa run sometimes stops answering: the test reaches `$finish` with a clean UVM
+report and `vsim` never exits, or the simulation stalls midway and the same seed runs
+green alone. `regr_runner` reads each test's output while it runs and handles both.
+
+| what happened | what the runner does |
+|---|---|
+| the simulator still runs `--finish_grace` seconds (default 60) after `$finish` | kills it and judges the test from its output up to `$finish` |
+| `--timeout` fires after `$finish` | the same: the verdict comes from the output |
+| the license process fails after `$finish` (vsim exits 43) | the same |
+| `--timeout` fires before `$finish`, or the license process fails before it | the run is lost, not failed: it runs again with the same seed (`--reruns`, default 1), and a second loss is FAILED |
+
+A verdict read from the output follows test_runner's own rules for a simulation log:
+the UVM report summary must be there and read `UVM_ERROR : 0` and `UVM_FATAL : 0`, a
+simulator error or Fatal fails it, and a UVM warning (or a `UVM_WARNING` count above 0)
+or an unwaived simulator warning makes it PASSED_WARN, which `--pedant` fails. A test
+that declares `expect_fail` passes only when the output failed and carries its text.
+`summary.txt` lists both kinds: `Reruns:` (seed, why, the lost run's log
+`test.try1.log`, the rerun's result) and `Judged from the output:`.
+
+Every kill takes the test's whole session, and the killed test's log ends with what
+each of its processes was doing: state, CPU seconds, and the kernel function it waited
+in (WCHAN). A stalled simulator sleeps with its CPU time flat; a busy one is running.
+Why the session: `vsim`'s front end (`vish`) runs the kernel (`vsimk`) and a license
+process (`vlm`, which runs `salt_mgls_asynch`), and `vlm` puts itself in a process group
+of its own. The process group kill used before missed it, and `vlm` printed
+`** Fatal: Read failure in vlm process (0,0)` as it noticed its `vsim` gone. That line
+in an older log marks a test the runner killed; it is not what made the test hang.
+
 ### Place-and-time numbers (`pnr_runner`)
 
 `metric_runner` stops at logic depth on a toy library, which says nothing about

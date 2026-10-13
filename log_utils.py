@@ -18,6 +18,33 @@ def print_test_status(status):
         print(f"{color}  | |_ (_   |    |_ /\\   |  |  |_ | \\   \033[0m")
         print(f"{color}  | |_ __)  |    | /--\\ _|_ |_ |_ |_/   \033[0m")
 
+def scan_log_lines(lines, passed_patterns=(), warning_patterns=(), failed_patterns=(), waiver_patterns=()):
+    """The verdict of a log's lines, printing nothing: (status, errors,
+    warnings). Status is PASSED, PASSED_WARN, FAILED or UNKNOWN (no pass
+    pattern matched). parse_log's rules; regr_runner also applies them to
+    the output of a run whose exit code it lost."""
+    status = "UNKNOWN"
+    errors = []
+    warnings = []
+    for line in lines:
+        # Check for waiver patterns
+        if any(re.search(pattern, line) for pattern in waiver_patterns):
+            continue
+        # Check for failed patterns
+        if any(re.search(pattern, line) for pattern in failed_patterns):
+            status = "FAILED"
+            errors.append(line.strip())
+        # Check for warning patterns
+        if any(re.search(pattern, line) for pattern in warning_patterns):
+            warnings.append(line.strip())
+        # Check for passed patterns (only if status is still UNKNOWN)
+        if status == "UNKNOWN" and all(re.search(pattern, line) for pattern in passed_patterns):
+            status = "PASSED"
+    if status == "PASSED" and warnings:
+        status = "PASSED_WARN"
+    return status, errors, warnings
+
+
 def parse_log(log_file_path,passed_patterns=[],warning_patterns=[],failed_patterns=[], waiver_patterns=[], print_banner=False, print_matches=False):
     # Default status so a missing/unreadable log file still returns cleanly.
     status = "UNKNOWN"
@@ -25,28 +52,10 @@ def parse_log(log_file_path,passed_patterns=[],warning_patterns=[],failed_patter
         with open(log_file_path, 'r') as log_file:
             lines = log_file.readlines()
 
-        # Variables to track test status and errors
-        errors = []
-        warnings = []
-        # Iterate through lines to check for passed and failed patterns
-        for line in lines:
-            # Check for waiver patterns
-            if any(re.search(pattern, line) for pattern in waiver_patterns):
-                continue
-            # Check for failed patterns
-            if any(re.search(pattern, line) for pattern in failed_patterns):
-                status = "FAILED"
-                errors.append(line.strip())
-            # Check for warning patterns
-            if any(re.search(pattern, line) for pattern in warning_patterns):
-                print(f"{line}")
-                warnings.append(line.strip())
-            # Check for passed patterns (only if status is still UNKNOWN)
-            if status == "UNKNOWN" and all(re.search(pattern, line) for pattern in passed_patterns):
-                status = "PASSED"
-
-        if status == "PASSED" and warnings:
-                status = "PASSED_WARN"
+        status, errors, warnings = scan_log_lines(lines, passed_patterns, warning_patterns,
+                                                  failed_patterns, waiver_patterns)
+        for warning in warnings:
+            print(f"{warning}\n")
 
         if print_banner:
             print_test_status(status)
