@@ -182,15 +182,14 @@ def comp_of_tests(block):
     Several tests share one compilation (one design, several UVM tests), and
     that is the unit a work library is built for. Parsed once per block: the
     file is 200 KB, the parse 0.4 s, and a 780-member list asked for it
-    twice per member on the main thread (10 minutes of a 25-minute run)."""
+    twice per member on the main thread (10 minutes of a 25-minute run).
+    Read the way test_runner reads it: Jinja rendered first, then YAML."""
     if block in _comp_cache:
         return _comp_cache[block]
     path = Path(wa_root) / "verif" / block / "lib" / "tests.yaml"
-    try:
-        loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
-        data = yaml.load(path.read_text(), Loader=loader) or {}
-    except OSError:
+    if not path.is_file():
         return {}
+    data = load_yaml(str(path)) or {}
     _comp_cache[block] = {t.get("name"): t.get("comp")
                           for t in (data.get("tests") or [])
                           if t.get("name") and t.get("comp")}
