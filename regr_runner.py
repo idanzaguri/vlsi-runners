@@ -27,18 +27,15 @@ def _timed_out_but_finished_cleanly(text, expect_fail=None):
     as a real failure.
 
     The proof is the UVM report summary printed before $finish, with zero
-    UVM_ERROR and UVM_FATAL, and no simulator error before $finish. A
-    Synopsys VIP's "SvtTestEpilog: Passed" counts too, but an env without
-    that VIP never prints it, so it is not required: the rule once asked for
-    it and every such flake in a plain-UVM env read as a failure. A test that
-    declares expect_fail never counts: its verdict needs the failure it
+    UVM_ERROR and UVM_FATAL, and no simulator error before $finish. A test
+    that declares expect_fail never counts: its verdict needs the failure it
     expects, which a clean summary says did not happen."""
     if expect_fail:
         return False
     head, sep, _tail = text.partition("$finish")
     if not sep:
         return False
-    if "SvtTestEpilog: Passed" not in text and "UVM Report Summary" not in head:
+    if "UVM Report Summary" not in head:
         return False
     if not re.search(r"UVM_ERROR\s*:\s*0\b", head):
         return False
