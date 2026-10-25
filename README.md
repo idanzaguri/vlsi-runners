@@ -104,6 +104,42 @@ of its own. The process group kill used before missed it, and `vlm` printed
 `** Fatal: Read failure in vlm process (0,0)` as it noticed its `vsim` gone. That line
 in an older log marks a test the runner killed; it is not what made the test hang.
 
+### Tests on other machines (`regr_runner --launcher srun`, Slurm)
+
+With `--launcher srun`, `regr_runner` starts every design build and every test through
+Slurm's `srun`. Slurm runs each job on a machine with a free slot and keeps the others
+in its queue. All the sessions and runners that use Slurm share one limit. The setup
+(lab-lnx first, then more machines) is in [docs/slurm.md](docs/slurm.md).
+
+```bash
+python3 bin/runners/regr_runner.py --tests <regr.yaml> --name <run> \
+    --launcher srun --srun_args="--constraint=questa" --max_parallel 40
+```
+
+| option | what it does |
+|---|---|
+| `--launcher local\|srun` | `local` (the default) runs everything on this machine. `srun` runs it through Slurm. |
+| `--srun_args "<options>"` | extra `srun` options for every build and test. `--constraint=questa` keeps the tests on machines with a Questa license. Never `--job-name`: the runner names each job. |
+
+What changes with `srun`:
+
+- `--max_parallel` is how many tests the runner hands to Slurm at once.
+- `--timeout` counts from the moment a test starts on its machine, not from the moment
+  it entered the queue. The summary's times are run times too.
+- The first line of `test.log` says where the test ran:
+  `[regr_runner] started: host lab-lnx, Slurm job 29, session 3344136`.
+- A kill works as on the local machine. A second `srun` step inside the test's job
+  (`--overlap`) writes what each process was doing into `test.log` and kills the test's
+  whole session on its machine. Then `scancel` ends the job.
+- A test that Slurm ended before `$finish` (its machine failed, or someone cancelled
+  it) is a lost run and runs again with the same seed (`--reruns`). After `$finish`,
+  the verdict comes from the output.
+- Ctrl-C cancels all the runner's jobs, also those still in the queue.
+
+Every machine needs the same Ubuntu release, the same user and UID, the same tools at
+the same paths, and the work area at the same path (NFS). A machine that runs Questa
+tests needs its own Questa license.
+
 ### Place-and-time numbers (`pnr_runner`)
 
 `metric_runner` stops at logic depth on a toy library, which says nothing about

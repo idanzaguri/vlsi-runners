@@ -10,6 +10,10 @@ import subprocess
 import concurrent.futures
 import time
 import shutil
+import shlex
+import getpass
+import inspect
+import itertools
 from pathlib import Path
 import random
 from proj_utils import *
@@ -179,9 +183,10 @@ class _Output:
     the runner sees the simulator's $finish line while the simulator still
     runs."""
 
-    def __init__(self, proc):
+    def __init__(self, proc, job=None):
         self.out, self.err = [], []
         self.finish_at = None  # when the $finish line arrived
+        self.job = job         # the test's _SlurmJob, which reads its start line here
         self._threads = [threading.Thread(target=self._pump, args=(proc.stdout, self.out, True), daemon=True),
                          threading.Thread(target=self._pump, args=(proc.stderr, self.err, False), daemon=True)]
         for t in self._threads:
@@ -190,6 +195,8 @@ class _Output:
     def _pump(self, stream, sink, watch):
         for line in iter(stream.readline, ""):
             sink.append(line)
+            if watch and self.job and self.job.started_at is None:
+                self.job.saw(line)
             if watch and self.finish_at is None and _FINISH_RE.search(line):
                 self.finish_at = time.time()
         stream.close()
@@ -201,6 +208,130 @@ class _Output:
         for t in self._threads:
             t.join(max(0.0, end - time.time()))
         return not any(t.is_alive() for t in self._threads)
+
+
+# ----------------------------------------------------------------------
+# Tests on other machines (--launcher srun).
+#
+# With --launcher srun the runner starts every design build and every test
+# through Slurm's srun. Slurm picks the machine and keeps the test in its
+# queue until a machine has a free slot, so every runner and session that
+# uses Slurm shares one limit. Every machine must see the work area at the
+# same path (NFS) and have the same tools.
+#
+# A test run this way is treated as a local one: --timeout counts from the
+# moment the test starts on its machine, not from the moment it was queued;
+# a kill takes the test's whole session on that machine and writes what
+# each process was doing into the test's log (both through a second srun
+# step inside the test's job, --overlap), then scancel ends the job. A test
+# that Slurm ended before $finish (its machine failed, or someone cancelled
+# it) is LOST and rerun, as a test killed at --timeout is.
+# ----------------------------------------------------------------------
+
+launcher = "local"  # "local" or "srun" (see --launcher)
+srun_args = []      # extra srun options (see --srun_args)
+
+# The program srun runs on the test's machine, ahead of the test. A task of
+# slurmstepd leads a process group of its own but shares slurmstepd's
+# session, and setsid() refuses a group leader, so it forks: the child takes
+# a session of its own, prints where it runs and becomes the test; the
+# parent waits and returns the test's exit code. The parent passes a
+# SIGTERM or SIGINT on to the test instead of dying of it, because without
+# cgroups Slurm finds a job's processes through their parents.
+_SRUN_TASK = r"""
+import os, signal, socket, sys
+pid = os.fork()
+if pid == 0:
+    os.setsid()
+    print(f"[regr_runner] started: host {socket.gethostname()}, Slurm job "
+          f"{os.environ.get('SLURM_JOB_ID', '?')}, session {os.getpid()}", flush=True)
+    os.execvp(sys.argv[1], sys.argv[1:])
+def pass_on(sig, frame):
+    try:
+        os.killpg(pid, sig)
+    except OSError:
+        pass
+for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(sig, pass_on)
+code = os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])
+sys.exit(code if code >= 0 else 128 - code)
+"""
+_STARTED_RE = re.compile(r"^\[regr_runner\] started: host (\S+), Slurm job (\S+), session (\d+)")
+
+# What srun and slurmstepd print when Slurm, not the test, ended a job: its
+# machine failed ("Node failure on <host>"), or someone cancelled it
+# ("*** STEP 24.0 ON <host> CANCELLED AT <time> ...")
+_SLURM_LOST_RE = re.compile(r"srun: error: Node failure on \S+|\*\*\* (?:JOB|STEP) \S+ ON \S+ CANCELLED AT .*")
+
+
+def _session_tool():
+    """The source of a small program that does, on the machine of a test
+    started through srun, what the runner does to a local test it kills:
+    print what each process of the test's session was doing (argument
+    "snapshot"), then kill the session. It is built from the runner's own
+    functions, so it needs only python3 on that machine."""
+    funcs = (_session_members, _signal_session, _kill_session, _session_snapshot)
+    return ("import os, signal, sys, time\n"
+            + "".join(inspect.getsource(f) for f in funcs)
+            + "sid = int(sys.argv[1])\n"
+              "if 'snapshot' in sys.argv[2:]:\n"
+              "    print('\\n'.join(_session_snapshot(sid)), flush=True)\n"
+              "_kill_session(sid)\n")
+
+
+class _SlurmJob:
+    """One test or design build started through srun: its job name, unique
+    to this runner, and, once it started, where it runs (the line
+    _SRUN_TASK prints)."""
+
+    _serial = itertools.count(1)
+
+    def __init__(self, label):
+        self.name = f"{label}.r{os.getpid()}.{next(self._serial)}"
+        self.host = self.job_id = self.sid = None
+        self.started_at = None  # when the start line arrived
+
+    def command(self, cmd_args, minutes=None):
+        """srun, its options, then ``cmd_args``. ``minutes`` is Slurm's own
+        time limit for the job, which ends it if the runner is no longer
+        there to; a --time in --srun_args wins. Only the options the runner
+        needs are set here, since srun gives a mixed result for an option
+        given twice."""
+        cmd = ["srun", f"--job-name={self.name}", "--input=none", "--unbuffered", "--quit-on-interrupt"]
+        if minutes and not any(a.startswith(("-t", "--time")) for a in srun_args):
+            cmd.append(f"--time={minutes}")
+        return cmd + srun_args + ["python3", "-c", _SRUN_TASK] + cmd_args
+
+    def saw(self, line):
+        """Read the start line, if ``line`` is it."""
+        m = _STARTED_RE.match(line)
+        if m:
+            self.host, self.job_id, self.sid = m.group(1), m.group(2), int(m.group(3))
+            self.started_at = time.time()
+
+    def stop(self, snapshot=False):
+        """Kill the job's session on its machine (after printing what each
+        of its processes was doing, with ``snapshot``), then cancel the
+        job, which also takes it out of the queue if it never started.
+        Returns the snapshot's rows."""
+        rows = []
+        if self.sid is not None:
+            cmd = (["srun", f"--jobid={self.job_id}", "--overlap", "--input=none",
+                    "python3", "-c", _session_tool(), str(self.sid)] + (["snapshot"] if snapshot else []))
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=60,
+                                   stdin=subprocess.DEVNULL)
+                rows = r.stdout.splitlines()
+                if snapshot and not rows:
+                    rows = [f"(no snapshot from {self.host}: {r.stderr.strip()[:200]})"]
+            except (OSError, subprocess.TimeoutExpired) as e:
+                rows = [f"(no snapshot from {self.host}: {e})"]
+        try:
+            subprocess.run(["scancel", f"--user={getpass.getuser()}", f"--name={self.name}"],
+                           capture_output=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return rows if snapshot else []
 
 
 global wa_root
@@ -218,10 +349,16 @@ finish_grace = 60   # seconds a simulator may live on after $finish (see --finis
 def _terminate_running_procs(grace=2):
     """Kill every in-flight test (test_runner, its vlog/vsim children and
     the license processes). Each test runs in a session of its own, so the
-    session reaches the whole tree."""
+    session reaches the whole tree. A test started through srun is stopped
+    on its machine and its job cancelled first, all at once."""
     with _running_procs_lock:
         _abort_event.set()  # block any not-yet-launched worker from spawning a new test
         procs = list(_running_procs.values())
+    stoppers = [threading.Thread(target=p.slurm.stop) for p in procs if getattr(p, "slurm", None)]
+    for t in stoppers:
+        t.start()
+    for t in stoppers:
+        t.join(150)
     for proc in procs:
         _signal_session(proc.pid, signal.SIGTERM)
     time.sleep(grace)  # give them a chance to exit cleanly...
@@ -241,7 +378,8 @@ def run_test(block, test, seed, rundir, codecov=False, simulator="modelsim",
     Returns (block, test, seed, status, seconds, note). The status is
     PASSED, PASSED_WARN or FAILED, or LOST: the simulator stopped before
     $finish for a reason that is not the test's (the runner killed it at
-    the timeout, or its license process failed), and the caller reruns it.
+    the timeout, its license process failed, or Slurm ended its job), and
+    the caller reruns it.
     ``note`` says, in a few words, what the runner did beyond reading
     test_runner's exit code, or is None."""
     cmd = f"python3 {_TEST_RUNNER} --block {block} --test {test} --seed {seed} --rundir {rundir} --simulator {simulator}"
@@ -251,19 +389,27 @@ def run_test(block, test, seed, rundir, codecov=False, simulator="modelsim",
         cmd += " --codecov"
 
     cmd_args = shlex.split(cmd)
+    job = None
+    if launcher == "srun":
+        # Slurm's own time limit, past --timeout, ends a test whose runner died
+        job = _SlurmJob(f"{test}.{seed}")
+        cmd_args = job.command(cmd_args, minutes=test_timeout // 60 + 2)
     # Register under the lock and bail out if an abort is already in progress, so a
     # worker that hasn't launched yet won't spawn an unkillable process after the
     # interrupt handler has already swept _running_procs.
     # start_new_session=True puts this test (and everything it starts) in a
-    # session of its own, which is what a kill of the test takes.
+    # session of its own, which is what a kill of the test takes. With srun,
+    # that session holds srun; the test's own session is on its machine.
     t_start = time.time()
     with _running_procs_lock:
         if _abort_event.is_set():
             return block, test, seed, "FAILED", 0.0, None
         proc = subprocess.Popen(cmd_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                stdin=subprocess.DEVNULL if job else None,
                                 text=True, errors="replace", start_new_session=True)
+        proc.slurm = job
         _running_procs[proc.pid] = proc
-    output = _Output(proc)
+    output = _Output(proc, job)
     killed, snapshot = None, []
     try:
         while True:
@@ -273,13 +419,22 @@ def run_test(block, test, seed, rundir, codecov=False, simulator="modelsim",
             except subprocess.TimeoutExpired:
                 pass
             now = time.time()
+            # a test still in Slurm's queue has not started yet
+            started = job.started_at if job else t_start
             if finish_grace and output.finish_at is not None and now - output.finish_at >= finish_grace:
                 killed = "after_finish"
-            elif now - t_start >= test_timeout:
+            elif started is not None and now - started >= test_timeout:
                 killed = "timeout"
             if killed:
-                snapshot = _session_snapshot(proc.pid)
-                _kill_session(proc.pid)
+                if job:
+                    snapshot = job.stop(snapshot=True)
+                    try:
+                        proc.wait(timeout=60)  # srun ends with its job
+                    except subprocess.TimeoutExpired:
+                        _kill_session(proc.pid)
+                else:
+                    snapshot = _session_snapshot(proc.pid)
+                    _kill_session(proc.pid)
                 proc.wait()
                 break
         # the pipes reach their end once every process holding them is gone:
@@ -317,6 +472,17 @@ def run_test(block, test, seed, rundir, codecov=False, simulator="modelsim",
         status = "PASSED"
     elif proc.returncode == 2:
         status = "PASSED_WARN"
+    elif job and _SLURM_LOST_RE.search(stderr):
+        why = _SLURM_LOST_RE.search(stderr).group(0).strip()
+        if head is not None:
+            status = _verdict_from_output(head, simulator, expect)
+            note = "Slurm ended its job after $finish"
+            notes.append(f"Slurm ended the job after $finish (srun exit code {proc.returncode}: "
+                         f"{why}), so the output up to $finish decides: {status}")
+        else:
+            status = "LOST"
+            note = "Slurm ended its job before $finish"
+            notes.append(f"Slurm ended the job before $finish (srun exit code {proc.returncode}: {why})")
     elif _LICENSE_FAIL_RE.search(log_text):
         if head is not None:
             status = _verdict_from_output(head, simulator, expect)
@@ -342,7 +508,9 @@ def run_test(block, test, seed, rundir, codecov=False, simulator="modelsim",
         log_file.write(log_text)
         if notes:
             log_file.write("\n" + "".join(f"[regr_runner] {n}\n" for n in notes))
-    return block, test, seed, status, time.time() - t_start, note
+    # the test's own time: a wait in Slurm's queue is not part of it
+    t_run = job.started_at if job and job.started_at else t_start
+    return block, test, seed, status, time.time() - t_run, note
 
 
 def clean_test_files(rundir, success, keep_patterns = ["test.log", "test.try*.log", "coverage.ucdb"]):
@@ -412,7 +580,11 @@ def build_lib(block, comp, test, build_dir, codecov=False, simulator="modelsim")
            f"--compile-only --rundir {build_dir} --simulator {simulator}")
     if codecov:
         cmd += " --codecov"
-    r = subprocess.run(shlex.split(cmd), capture_output=True, text=True)
+    cmd_args = shlex.split(cmd)
+    if launcher == "srun":
+        cmd_args = _SlurmJob(f"build.{comp}").command(cmd_args)
+    r = subprocess.run(cmd_args, capture_output=True, text=True,
+                       stdin=subprocess.DEVNULL if launcher == "srun" else None)
     ok = r.returncode == 0
     if not ok:
         (build_dir / "build.log").write_text(r.stdout + r.stderr)
@@ -604,6 +776,8 @@ def main():
     parser.add_argument("--reruns", type=int, default=1, help="How many times a test whose simulator stopped before $finish for a reason that is not the test's (killed at --timeout, or its license process failed) is rerun with the same seed before it counts as FAILED; 0 never reruns (default: 1)")
     parser.add_argument("--simulator", type=str, choices=["modelsim", "vcs"], default="modelsim", help="Simulator to use for every test in the regression (default: modelsim)")
     parser.add_argument("--no-shared-lib", action="store_true", help="Compile and optimize inside every test, as before the shared design libraries (slower; use if a library build is in the way)")
+    parser.add_argument("--launcher", choices=["local", "srun"], default="local", help="Where each design build and test runs: local runs it on this machine; srun runs it through Slurm, which picks a machine with a free slot and queues it until there is one. The work area must have the same path on every machine (see README 'Tests on other machines'). With srun, --max_parallel is how many tests the runner hands to Slurm at once, and --timeout counts from the moment a test starts on its machine (default: local)")
+    parser.add_argument("--srun_args", type=str, default="", help="Extra srun options for every build and test with --launcher srun, as one string, e.g. \"--constraint=questa\" to keep Questa runs on the machines that have a Questa license. Never --job-name: the runner names each job itself (default: none)")
     args = parser.parse_args()
 
     if args.name is None:
@@ -626,13 +800,23 @@ def main():
     print(f"{BOLD_CYAN}{ascii_art}{RESET}")
 
 
-    global wa_root, test_timeout, finish_grace
+    global wa_root, test_timeout, finish_grace, launcher, srun_args
     test_timeout = args.timeout
     finish_grace = args.finish_grace
+    launcher = args.launcher
+    srun_args = shlex.split(args.srun_args)
     wa_root = get_git_root()
     if not wa_root:
         print_message("error","You are not inside valid workarea.")
         exit(1)
+    if launcher == "srun":
+        if not (shutil.which("srun") and shutil.which("scancel")):
+            print_message("error", "--launcher srun: srun and scancel are not on PATH (is Slurm installed?)")
+            exit(1)
+        if any(a.startswith(("-J", "--job-name")) for a in srun_args):
+            print_message("error", "--srun_args: leave out --job-name, the runner names each job itself")
+            exit(1)
+        print_message("info", f"builds and tests start through srun {' '.join(srun_args)}".rstrip())
     
     test_list = parse_test_list(args.tests)
     

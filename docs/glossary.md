@@ -68,6 +68,54 @@ runner reports them so two forms of one design can be compared.
 - **WCHAN**: the kernel function a sleeping process waits in, from
   `/proc/<pid>/wchan`. A killed test's log lists it for each process.
 
+## Tests on other machines (Slurm)
+
+- **Slurm**: a job scheduler. It keeps one queue for several machines and runs
+  each job on a machine with a free slot. Setup: [slurm.md](slurm.md).
+- **Launcher** (`--launcher`): how `regr_runner` starts each design build and
+  test. `local` runs it on this machine; `srun` runs it through Slurm.
+- **srun**: the Slurm command that runs one job and waits for it. It passes on
+  the job's output and exit code. `regr_runner` starts one `srun` per build and
+  per test.
+- **--srun_args**: extra `srun` options that `regr_runner` adds to every build
+  and test, for example `--constraint=questa`.
+- **scancel**: the Slurm command that cancels a job, running or still in the
+  queue.
+- **squeue, sinfo, scontrol**: Slurm commands that list the jobs, list the
+  machines, and show or change a job or a machine.
+- **slurmctld, slurmd, slurmstepd**: Slurm's controller (one, on lab-lnx), its
+  daemon on every machine, and the process that runs one job step on a
+  machine.
+- **Node**: a machine in Slurm.
+- **Partition**: a named group of nodes that jobs go to. The setup has one,
+  `main`.
+- **Slot**: one CPU that Slurm can give to a job. A test takes one.
+- **Feature, constraint**: a word that slurm.conf gives a node
+  (`Features=questa`) and that a job asks for (`--constraint=questa`). The job
+  runs only on nodes that have it.
+- **Queue, pending**: a job that waits for a free slot is in the queue;
+  `squeue` shows it as PENDING.
+- **Job name**: `regr_runner` names each job `<test>.<seed>.r<pid>.<n>`, so it
+  can cancel exactly its own jobs.
+- **Start line**: the first line a test prints through `srun`:
+  `[regr_runner] started: host <machine>, Slurm job <id>, session <id>`.
+  `--timeout` counts from it.
+- **Overlap step** (`srun --jobid=<id> --overlap`): a second command run inside
+  a job that is already running. `regr_runner` uses it to list and kill a
+  test's processes on the test's machine.
+- **Drain**: a node state (`scontrol update nodename=<n> state=drain`). The node
+  gets no new jobs, and the jobs on it finish.
+- **munge**: the service that signs the messages between Slurm's daemons and
+  commands. Every machine needs the same key, `/etc/munge/munge.key`.
+- **cgroup**: a Linux group of processes. With `proctrack/cgroup`, Slurm finds
+  all the processes of a job by their cgroup and can kill all of them.
+- **CPUSpecList**: CPUs of a node that Slurm keeps out of its slots, for work
+  outside Slurm.
+- **NFS**: a network file system. Every machine mounts the work area at the
+  same path, so a job sees the same files on any machine.
+- **NIC ID**: the network card address that Intel ties a Questa Starter
+  Edition license to. Each machine needs its own license.
+
 ## From RTL to a placed chip
 
 - **RTL**: the SystemVerilog you write (registers and the logic between
