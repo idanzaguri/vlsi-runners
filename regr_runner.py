@@ -15,6 +15,7 @@ import json
 import getpass
 import inspect
 import itertools
+import fnmatch
 from pathlib import Path
 import random
 from proj_utils import *
@@ -373,7 +374,7 @@ def _terminate_running_procs(grace=2):
 
 
 def run_test(block, test, seed, rundir, codecov=False, simulator="modelsim",
-             lib=None):
+             lib=None, sim_args=()):
     """Runs a single test instance with the given parameters.
 
     ``lib`` is a work library built once for this test's DESIGN (see
@@ -387,11 +388,17 @@ def run_test(block, test, seed, rundir, codecov=False, simulator="modelsim",
     the caller reruns it.
     ``note`` says, in a few words, what the runner did beyond reading
     test_runner's exit code, or is None."""
-    cmd = f"python3 {_TEST_RUNNER} --block {block} --test {test} --seed {seed} --rundir {rundir} --simulator {simulator}"
+    # test_runner with this interpreter: a project's bin/setenv.sh may put
+    # another python3 first on PATH (a cocotb .venv)
+    cmd = (f"{sys.executable} {_TEST_RUNNER} --block {block} --test {test} --seed {seed} "
+           f"--rundir {rundir} --simulator {simulator}")
     if lib:
         cmd += f" --run-only --lib {lib}"
     if codecov:
         cmd += " --codecov"
+    if sim_args:
+        # the regression entry's plusargs, on top of the test's own
+        cmd += " --sim_args " + " ".join(shlex.quote(a) for a in sim_args)
 
     cmd_args = shlex.split(cmd)
     job = None
@@ -582,8 +589,12 @@ def expect_fail_of(block, test):
 def build_lib(block, comp, test, build_dir, codecov=False, simulator="modelsim"):
     """Compile and optimize one design ONCE, into its own work library."""
     build_dir.mkdir(parents=True, exist_ok=True)
-    cmd = (f"python3 {_TEST_RUNNER} --block {block} --test {test} "
+    cmd = (f"{sys.executable} {_TEST_RUNNER} --block {block} --test {test} "
            f"--compile-only --rundir {build_dir} --simulator {simulator}")
+    if simulator == "verilator":
+        # the regression's own build, which its tests then run (--lib); test_runner
+        # alone shares one under sim/<block>/_build/
+        cmd += f" --lib {build_dir / 'obj_dir'}"
     if codecov:
         cmd += " --codecov"
     cmd_args = shlex.split(cmd)
@@ -597,26 +608,152 @@ def build_lib(block, comp, test, build_dir, codecov=False, simulator="modelsim")
     return (block, comp), ok
 
 
-def parse_test_list(file_path):
-    jinja2_variables = {}
+def _seeds(value):
+    """The seeds of a regression entry: one seed, a list, or a range "a-b"."""
+    if isinstance(value, int):
+        return [value]
+    if isinstance(value, str):
+        m = re.fullmatch(r"\s*(\d+)\s*-\s*(\d+)\s*", value)
+        if not m:
+            print_message("error", f"seeds {value!r} is not a seed, a list or a range a-b")
+            exit(1)
+        return list(range(int(m.group(1)), int(m.group(2)) + 1))
+    return [int(x) for x in value]
 
+
+def blocks_with_tests():
+    """Every block that has tests: verif/<block>/lib/tests.yaml."""
+    return sorted(p.parent.parent.name for p in (Path(wa_root) / "verif").glob("*/lib/tests.yaml"))
+
+
+def expand_regression(regressions, name, held, seen=()):
+    """The one-test entries of a named regression, its includes expanded.
+
+    An entry is one test ({block, test, seed or weight}), or a set:
+    {blocks: all or a list, tests: names or globs, seeds: a seed, a list or
+    "a-b", sim_args: plusargs}, or {include: <regression>}. `blocks: all` is
+    every block with a tests.yaml but the `held` ones, and skips a block
+    that lacks a test; a block named in the entry must have it. An entry
+    without seeds takes random ones, as many as --repeat."""
+    if name not in regressions:
+        print_message("error", f"no regression {name!r}; there are {', '.join(regressions)}")
+        exit(1)
+    if name in seen:
+        print_message("error", f"regression {name!r} includes itself through {' -> '.join(seen)}")
+        exit(1)
+    out = []
+    for e in regressions[name] or []:
+        if "include" in e:
+            out += expand_regression(regressions, e["include"], held, seen + (name,))
+            continue
+        if "block" in e:
+            out.append(dict(e))
+            continue
+        every = e.get("blocks", "all") == "all"
+        blocks = [b for b in blocks_with_tests() if b not in held] if every else e["blocks"]
+        patterns = e["tests"] if isinstance(e["tests"], list) else [e["tests"]]
+        for block in blocks:
+            have = list(comp_of_tests(block))
+            if not have and not every:
+                print_message("error", f"regression {name!r}: no tests in verif/{block}/lib/tests.yaml")
+                exit(1)
+            for pattern in patterns:
+                names = [n for n in have if fnmatch.fnmatchcase(n, pattern)]
+                if not names and not every:
+                    print_message("error", f"regression {name!r}: {block} has no test {pattern!r}; "
+                                           f"it has {', '.join(have)}")
+                    exit(1)
+                for test in names:
+                    one = {"block": block, "test": test, "sim_args": list(e.get("sim_args") or [])}
+                    if "seeds" in e:
+                        out += [{**one, "seed": seed} for seed in _seeds(e["seeds"])]
+                    else:
+                        out.append({**one, **({"weight": e["weight"]} if "weight" in e else {})})
+    return out
+
+
+def parse_test_list(file_path, regression=None):
+    """The entries of a regression file and its settings.
+
+    A file is a list of tests (`tests:`, one entry a test), or named
+    regressions (`regressions:`, one picked with --regression; see
+    :func:`expand_regression`). Either may carry `held` (block: why, kept
+    out of `blocks: all`), `keep` (more file patterns a passing run keeps,
+    e.g. a bench's own coverage dump) and `hooks` (see :func:`run_hooks`).
+    Read the way test_runner reads tests.yaml: Jinja rendered first."""
     try:
         with open(file_path, 'r') as f:
             raw_content = f.read()
-    except:
-        print_message("error", f"Filed to open regr file - {file_path}")
+    except OSError:
+        print_message("error", f"Failed to open regr file - {file_path}")
         exit(1)
-
-    # Apply Jinja2 rendering first
-    template = Template(raw_content, undefined=StrictUndefined)
-    rendered_content = template.render(jinja2_variables)
- 
+    rendered_content = Template(raw_content, undefined=StrictUndefined).render({})
     try:
         content = yaml.safe_load(rendered_content) or {}
     except yaml.YAMLError as e:
         raise ValueError(f"Error parsing YAML after Jinja2 rendering: {e}")
-    
-    return content.get("tests", [])
+    settings = {"held": content.get("held") or {}, "keep": list(content.get("keep") or []),
+                "hooks": list(content.get("hooks") or [])}
+    if "regressions" in content:
+        names = ", ".join(content["regressions"])
+        if not regression:
+            print_message("error", f"{file_path} holds several regressions; pick one with "
+                                   f"--regression ({names})")
+            exit(1)
+        return expand_regression(content["regressions"], regression, settings["held"]), settings
+    if regression:
+        print_message("error", f"--regression {regression}: {file_path} holds one list of tests")
+        exit(1)
+    return content.get("tests", []), settings
+
+
+def run_hooks(hooks, regression_dir, results, codecov, summary_path):
+    """Run the regression file's hooks, after the runs and the coverage
+    merge, and return how many failed (a non-zero exit fails the
+    regression).
+
+    A hook is {per: block or regression, run: <shell command>, when:
+    codecov (only with --codecov)}. `per: block` runs once for each block
+    with a passing run. The command runs in the work area's root after
+    bin/setenv.sh, with these words replaced: {block}, {block_dir} (the
+    block's folder of the regression), {regression_dir}, {wa_root} and
+    {passed} (a file that lists the passing runs' folders, one a line: the
+    block's, or all of them). Its output goes to hooks.log, and its last
+    line into the summary."""
+    passed = defaultdict(list)
+    for t in results:
+        if t[3] in ("PASSED", "PASSED_WARN"):
+            passed[t[0]].append(str(Path(t[4]).parent))
+    lines, failed = [], 0
+    with open(regression_dir / "hooks.log", "w") as log:
+        for hook in hooks:
+            if hook.get("when") == "codecov" and not codecov:
+                continue
+            per_block = hook.get("per", "regression") == "block"
+            for block in (sorted(passed) if per_block else [None]):
+                listing = regression_dir / (f"{block}/passed_runs.txt" if block else "passed_runs.txt")
+                listing.parent.mkdir(parents=True, exist_ok=True)
+                runs = passed[block] if block else [d for b in sorted(passed) for d in passed[b]]
+                listing.write_text("".join(f"{d}\n" for d in runs))
+                words = {"block": block or "", "block_dir": str(regression_dir / block) if block else "",
+                         "regression_dir": str(regression_dir), "wa_root": wa_root, "passed": str(listing)}
+                cmd = hook["run"]
+                for key, value in words.items():
+                    cmd = cmd.replace("{" + key + "}", shlex.quote(value))
+                r = subprocess.run(["bash", "-c", "set -a; [ -f bin/setenv.sh ] && source bin/setenv.sh; "
+                                    f"set +a; {cmd}"], cwd=wa_root, capture_output=True, text=True)
+                log.write(f"$ {cmd}\n{r.stdout}{r.stderr}[exit {r.returncode}]\n\n")
+                last = (r.stdout.strip().splitlines() or [""])[-1]
+                lines.append(f"{block or 'regression'}: {last}"
+                             + ("" if r.returncode == 0 else f"  FAILED (exit {r.returncode})"))
+                failed += r.returncode != 0
+    if lines:
+        text = "\n".join(lines)
+        print(f"After the runs (hooks.log):\n{text}")
+        with open(summary_path, "a") as f:
+            f.write(f"{'-'*40}\nAfter the runs (hooks.log):\n{text}\n")
+    return failed
+
 
 def summarize_results(results, summary_path, total_tests, start_time, pedant=False, reruns=()):
     """Generates a summary of all test results.
@@ -826,8 +963,10 @@ def print_block_table(block, tests):
 
 def main():
     parser = argparse.ArgumentParser(description="Regression test runner")
-    parser.add_argument("--tests", required=True, help="YAML file containing test list")
-    parser.add_argument("--name", type=str , help="regression name")
+    parser.add_argument("--tests", required=True, help="YAML file containing test list, or named regressions (see --regression)")
+    parser.add_argument("--regression", type=str, help="The regression to run, when --tests holds several (`regressions:`); see README 'Regression files'")
+    parser.add_argument("--name", type=str , help="regression name, the folder sim/regression/<name> (default: --regression, else the date and time)")
+    parser.add_argument("--list", action="store_true", help="Print the runs (block, test, seed, plusargs) and exit")
     parser.add_argument("--repeat", type=int, default=1, help="Number of times to run each test")
     parser.add_argument("--max_parallel", type=int, default=16, help="Maximum parallel tests")
     parser.add_argument("--stop_on_fail", action="store_true", help="Stop on first failure")
@@ -845,7 +984,7 @@ def main():
     args = parser.parse_args()
 
     if args.name is None:
-        args.name = datetime.datetime.now().strftime("%Y_%m_%d_%H%M%S")
+        args.name = args.regression or datetime.datetime.now().strftime("%Y_%m_%d_%H%M%S")
     ascii_art = r"""
        ___                           _             ___                        
       / _ \___ ___ ________ ___ ___ (_)__  ___    / _ \__ _____  ___  ___ ____
@@ -882,7 +1021,10 @@ def main():
             exit(1)
         print_message("info", f"builds and tests start through srun {' '.join(srun_args)}".rstrip())
     
-    test_list = parse_test_list(args.tests)
+    test_list, settings = parse_test_list(args.tests, args.regression)
+    if settings["held"]:
+        print_message("info", "held out of every `blocks: all`: "
+                      + ", ".join(f"{b} ({why})" for b, why in settings["held"].items()))
     
     for entry in test_list:
         if "seed" in entry:
@@ -894,7 +1036,6 @@ def main():
         
 
     regression_dir = Path(f"{wa_root}/sim/regression/{args.name}")
-    os.makedirs(str(regression_dir), exist_ok=True)
     
     results = []
     total_tests = sum(entry["repetitions"] for entry in test_list)
@@ -906,6 +1047,7 @@ def main():
     pending_tests = total_tests
     
     test_queue = []
+    sim_extra = {}  # (block, test, seed): the entry's plusargs
     grouped_tests = defaultdict(list)
     for entry in test_list:
         block, test, repetitions = entry["block"], entry["test"], entry["repetitions"]
@@ -916,8 +1058,30 @@ def main():
         else:
             unique_seeds = random.sample(range(0, 999999), entry["repetitions"])
         for seed in unique_seeds:
+            plus = list(entry.get("sim_args") or [])
+            if (block, test, seed) in sim_extra:
+                if sim_extra[(block, test, seed)] != plus:
+                    # one run folder per block, test and seed: two plusarg sets would share it
+                    print_message("error", f"{block} {test} seed {seed} runs with "
+                                           f"{' '.join(sim_extra[(block, test, seed)]) or 'no plusargs'} and with "
+                                           f"{' '.join(plus) or 'no plusargs'}; give one of them other seeds")
+                    exit(1)
+                total_tests -= 1
+                pending_tests -= 1
+                continue  # the same run twice
+            sim_extra[(block, test, seed)] = plus
             rundir = regression_dir / block / test / f"seed_{seed}"
             test_queue.append((block, test, seed, rundir, 1))
+    if args.list:
+        for block, test, seed, _rundir, _attempt in sorted(test_queue, key=lambda q: q[:3]):
+            print(f"{block} {test} seed {seed}" + (f" {' '.join(sim_extra[(block, test, seed)])}"
+                                                   if sim_extra[(block, test, seed)] else ""))
+        print(f"{len(test_queue)} run(s)")
+        return
+    if not test_queue:
+        print_message("error", "the regression has no runs")
+        exit(1)
+    os.makedirs(str(regression_dir), exist_ok=True)
     random.shuffle(test_queue)
 
     # Build each DESIGN once (Idan, 2026-09-16). Questa optimizes the design
@@ -978,7 +1142,8 @@ def main():
                 running_tests += 1
                 lib = libs.get((block, comp_of_tests(block).get(test)))
                 future = executor.submit(run_test, block, test, seed, rundir,
-                                         args.codecov, args.simulator, lib)
+                                         args.codecov, args.simulator, lib,
+                                         sim_extra.get((block, test, seed), ()))
                 futures[future] = (block, test, seed, rundir, attempt)
                 pbar.set_description(status())
                 pbar.update(0)
@@ -1022,7 +1187,9 @@ def main():
                     test_status, note = "FAILED", None
                 results.append((block, test, seed, test_status, test_log, elapsed, note))
                 if not args.keep:
-                    clean_test_files(rundir, test_status != "FAILED")
+                    clean_test_files(rundir, test_status != "FAILED",
+                                     ["test.log", "test.try*.log", "coverage.ucdb", "coverage.dat"]
+                                     + settings["keep"])
 
                 how = f" ({note})" if note else ""
                 if test_status == "PASSED":
@@ -1090,6 +1257,8 @@ def main():
     if args.codecov:
         report_coverage(merge_coverage(regression_dir, args.simulator), regression_dir,
                         regression_dir / "summary.txt")
+    hooks_failed = run_hooks(settings["hooks"], regression_dir, results, args.codecov,
+                             regression_dir / "summary.txt") if settings["hooks"] else 0
     
     effective_passed = passed_tests + (0 if args.pedant else passed_warn_tests)
     effective_failed = failed_tests + (passed_warn_tests if args.pedant else 0)
@@ -1101,7 +1270,9 @@ def main():
     else:
         print_message("warning",f"PASS_RATE: {pass_rate:.2f}%")
 
-    if effective_failed == 0:
+    if hooks_failed:
+        print_message("warning", f"{hooks_failed} hook(s) failed, see {regression_dir}/hooks.log")
+    if effective_failed == 0 and not hooks_failed:
         color = "\033[93m" if passed_warn_tests > 0 else "\033[92m"
         print(f"{color}  _       __  __  _  _  \033[0m")
         print(f"{color} |_) /\\  (_  (_  |_ | \\ \033[0m")
@@ -1114,6 +1285,11 @@ def main():
 
     print() 
     print_message("info", f"Rregression Report: {regression_dir}/summary.txt")
+    # a failed test (or, with --pedant, a warned one) or a failed hook fails
+    # the regression, for a gate that reads the exit code
+    sys.exit(1 if effective_failed or hooks_failed else 0)
+
+
 if __name__ == "__main__":
     main()
 

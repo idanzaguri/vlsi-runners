@@ -165,7 +165,15 @@ program still runs. Its output goes to `run.log`.
   Do not rely on the `fsm_state` and `fsm_arc` rows yet. Verilator's FSM coverage is new:
   on one test, 5.052 and Verilator main of 2026-10-25 gave different figures, and neither
   recorded the state machine's real transitions.
-- A build records what it can do in `obj_dir/vlsi_runners_build.json`. A run with
+- The coverage types are all of them (`--coverage`) unless the block's config.yaml names
+  some under `verilator_coverage`: `line` (with branches), `toggle`, `expr`, `fsm`,
+  `user`.
+- Where the build goes: a `regr_runner` regression builds each design once in its own
+  `_build/`. A `test_runner` run without `--lib` shares one build per design,
+  compilation and kind (`default`, `coverage`, `waves`, `waves_mem`, or two of them) in
+  `sim/<block>/_build/<comp>/<kind>/`, with a lock, so a second test of the design only
+  relinks: Verilator skips the rest when no input changed. `--clean` rebuilds it.
+- A build records what it can do in `vlsi_runners_build.json` beside it. A run with
   `--dump` or `--codecov` stops with an error when its build was made without it.
 - Verilator is 2-state. A test that checks X or Z cannot pass.
 - The Verilator for the runners on lab-lnx is `/opt/verilator/current`: Verilator main
@@ -175,6 +183,77 @@ program still runs. Its output goes to `run.log`.
   in ovip_axi. A project puts `/opt/verilator/current/bin` first on PATH in its
   `bin/setenv.local.sh`. On it, ovip_apb_testbench passes 7/7 and ovip_axi_testbench
   51/52 (ovip_axi_xz_test checks X).
+
+### cocotb benches (`--cocotb_module`, Verilator)
+
+A cocotb bench has its tests in Python. `--cocotb_module <module>` (with
+`--simulator verilator`) makes test_runner build the design with cocotb's own runner
+(`cocotb_tools.runner`, through `verilator/cocotb_run.py`) and run one test of the module
+against it. cocotb comes from the project: `verilator/cocotb_run.py` runs with the first
+`python3` on PATH after `bin/setenv.sh`, so a project puts its `.venv/bin` first there.
+
+```yaml
+# verif/<d>/lib/tests.yaml
+compilations:
+  - name: default
+    files:
+    args: ["--top <d>_top", "--cocotb_module test_<d>"]
+tests:
+  - { name: smoke, comp: default }                                      # cocotb test smoke
+  - { name: traffic_e60, comp: default, args: ["--cocotb_test traffic", "--sim_args +error_pct=60"] }
+```
+
+- The test module is found in `verif/<block>/`, which goes first on PYTHONPATH.
+- The build takes the file list of the Questa and UVM Verilator paths: the design blocks'
+  files and the bench's (checkers, `.cpp` sources), `comp_args`, `verilator_config`. The
+  bench's own Verilator switches (`--assert`, `--x-initial unique`, `-Wno-fatal`,
+  `--timescale 1ns/1ps`) go in its config.yaml `comp_args`; the runner adds none.
+- The run: cocotb seed `--seed`, Verilator seed `--seed` + 1, the plusargs of config.yaml,
+  tests.yaml and the command line. The most specific wins: `$value$plusargs` reads the first
+  match, so they come command line first; `cocotb.plusargs` keeps the last, so a cocotb run
+  gets them reversed. The run writes `run.log` and `results.xml` in the run directory.
+- The verdict: a failed test in `results.xml`, no test run, a `%Error` or `ERROR` line in
+  the log (an assertion prints one while `results.xml` may still say pass), or a runner that
+  ended badly fails the test. A `%Warning` or `WARNING` line, in the run or in its build,
+  makes it pass with warnings, which `--pedant` fails.
+- `--codecov` and `--dump` work as for UVM benches. The waves are cocotb's: `dump.vcd`.
+
+### Regression files (`regr_runner --tests`)
+
+A regression file is a list of tests, or several named regressions:
+
+```yaml
+held:                       # blocks kept out of every `blocks: all` (block: why)
+  axi_x: "finding VNOC-9 is open"
+keep: [cov.txt]             # more files a passing run keeps
+hooks:                      # commands after the runs (and the coverage merge)
+  - { per: block, run: "python3 bin/cov_merge.py {block} {passed} {block_dir}" }
+  - { per: regression, when: codecov, run: "python3 bin/rtl_holes.py {regression_dir}" }
+regressions:
+  check:
+    - { blocks: all, tests: [smoke, rw, "traffic*"], seeds: [0] }
+  errors:
+    - { blocks: all, tests: [traffic], seeds: "11-14", sim_args: [+rounds=40, +error_pct=60] }
+  nightly:
+    - { include: check }
+    - { include: errors }
+    - { block: apb_cdc, test: smoke, weight: 5 }   # the one-test form of a `tests:` list
+```
+
+- `--regression <name>` picks one; the run folder is `sim/regression/<name>/` unless
+  `--name` says otherwise. `--list` prints the runs and exits.
+- An entry is one test, or a set: `blocks` (`all`, or a list), `tests` (names or globs),
+  `seeds` (a seed, a list, or a range `"a-b"`; without it, random seeds as `--repeat`
+  says), `sim_args` (plusargs on top of the test's own). `blocks: all` skips a block that
+  lacks a test; a block named in the entry must have it. A block, test and seed that
+  comes twice runs once; with two different `sim_args` it is an error, since both would
+  share one run folder.
+- A hook runs in the work area's root after `bin/setenv.sh`, with `{block}`,
+  `{block_dir}`, `{regression_dir}`, `{wa_root}` and `{passed}` (a file listing the
+  passing runs' folders) replaced. `per: block` runs once for each block with a passing
+  run. Its output goes to `hooks.log`, its last line into `summary.txt`.
+- The exit code is 1 when a test failed (with `--pedant`, also one that passed with
+  warnings) or a hook failed, and 0 otherwise.
 
 ### Tests on other machines (`regr_runner --launcher srun`, Slurm)
 

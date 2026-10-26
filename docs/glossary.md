@@ -133,6 +133,46 @@ runner reports them so two forms of one design can be compared.
 - **vlsi_runners_build.json**: the record beside a Verilator build of what it
   can do: its verilator, its wave format and scope, and coverage.
 
+## cocotb benches and regression files
+
+- **cocotb**: a Python framework for testbenches. A cocotb test is a Python
+  coroutine that drives and reads the design's signals through VPI.
+- **Test module** (`--cocotb_module`): the Python module that holds a bench's
+  cocotb tests, found in `verif/<block>/`.
+- **--cocotb_test**: the cocotb test of the module that a test runs; by
+  default the test's name in tests.yaml.
+- **cocotb runner** (`cocotb_tools.runner`): cocotb's own way to build a design
+  for a simulator and run tests on it. test_runner calls it through
+  `verilator/cocotb_run.py`, with the project's Python.
+- **results.xml**: the file in which cocotb writes each test's result; a
+  failed test has a `failure` or `error` element there.
+- **cocotb.plusargs**: the plusargs as a cocotb test reads them; for a name
+  given twice it keeps the last value.
+- **Shared build**: one Verilator build per design, compilation and kind,
+  `sim/<block>/_build/<comp>/<kind>/`, which every test_runner run without
+  `--lib` uses.
+- **Build kind**: what a build adds: `default` (nothing), `coverage`, `waves`,
+  `waves_mem`, or two of them joined by `_`.
+- **verilator_coverage** (config.yaml): the coverage types a Verilator build
+  collects: `line`, `toggle`, `expr`, `fsm`, `user`; all of them without the
+  key.
+- **Named regression**: an entry list under `regressions:` in a regression
+  file, picked with `regr_runner --regression <name>`.
+- **blocks: all**: every block with a `verif/<block>/lib/tests.yaml`, except the
+  `held` ones.
+- **held**: blocks kept out of every `blocks: all` entry, each with the reason.
+- **seeds**: an entry's seeds: one seed, a list, or a range `"a-b"`.
+- **include**: an entry that takes another named regression's entries.
+- **keep**: file patterns, in a regression file, that a passing run keeps on
+  top of `test.log` and the coverage database.
+- **Hook**: a shell command in a regression file that runs after the runs
+  (`per: block` or `per: regression`); a non-zero exit fails the regression.
+- **passed_runs.txt**: the file a hook gets as `{passed}`: the folders of the
+  passing runs, one a line.
+- **hooks.log**: each hook's command, output and exit code, in the
+  regression's folder.
+- **--list**: regr_runner prints the runs of a regression and exits.
+
 ## Tests on other machines (Slurm)
 
 - **Slurm**: a job scheduler. It keeps one queue for several machines and runs

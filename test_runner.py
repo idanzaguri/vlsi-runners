@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -8,6 +9,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from proj_utils import *
 from log_utils import *
 
@@ -80,14 +82,16 @@ def _gather_attrs_and_filelist(args, simdir):
     """Run jinja substitution, parse attributes, write the filelist (shared
     between simulators -- +define+/+incdir+ syntax is the same for all
     three). Returns the simulation arguments, the design's files, and the
-    Verilator configuration files (config.yaml ``verilator_config``)."""
+    Verilator configuration files and coverage types (config.yaml
+    ``verilator_config``, ``verilator_coverage``)."""
     jinja2_variables = {
         "TOOL": {"modelsim": "vsim", "vcs": "vcs", "verilator": "verilator"}[args.simulator],
         "WA_ROOT": wa_root,
         "TOP_BLOCK": args.block,
         **os.environ,
     }
-    attributes_to_parse = ["include_dirs", "defines", "files", "comp_args", "sim_args", "verilator_config"]
+    attributes_to_parse = ["include_dirs", "defines", "files", "comp_args", "sim_args",
+                           "verilator_config", "verilator_coverage"]
     attributes, blocks = parse_attributes(args.block, "verif", attributes_to_parse,
                                           jinja2_variables, with_blocks=True)
     # the RTL under test: every file of every `design` block in the tree.
@@ -112,7 +116,7 @@ def _gather_attrs_and_filelist(args, simdir):
     if args.sim_args:
         sim_args.extend([w for sub in args.sim_args for item in sub for w in item.split()])
     sim_args.extend(attributes["sim_args"])
-    return " ".join(sim_args), design_files, attributes["verilator_config"]
+    return " ".join(sim_args), design_files, attributes["verilator_config"], attributes["verilator_coverage"]
 
 
 # ----------------------------------------------------------------------
@@ -669,148 +673,327 @@ def coverage_table(dat):
     return rows
 
 
-def run_verilator(args, simdir, sim_args, vlt_files=(), design_files=frozenset()):
+# The coverage types a project may name in config.yaml `verilator_coverage`,
+# and Verilator's switch for each. `line` records branches too. Without the
+# key a build takes them all (--coverage).
+_VLT_COVER_SWITCHES = {"line": "--coverage-line", "toggle": "--coverage-toggle",
+                       "expr": "--coverage-expr", "fsm": "--coverage-fsm", "user": "--coverage-user"}
+
+_COCOTB_RUN = os.path.join(_RUNNER_DIR, "verilator", "cocotb_run.py")
+
+
+def _coverage_switches(types):
+    if not types:
+        return ["--coverage"]
+    bad = [t for t in types if t not in _VLT_COVER_SWITCHES]
+    if bad:
+        print_message("error", f"config.yaml verilator_coverage: {', '.join(bad)} is not one of "
+                               f"{', '.join(_VLT_COVER_SWITCHES)}")
+        exit(1)
+    return [_VLT_COVER_SWITCHES[t] for t in types]
+
+
+def _build_kind(args):
+    """The kind of a build, the folder of a shared one: default, or what it
+    adds (coverage, waves, waves with memories)."""
+    parts = (["coverage"] if args.codecov else []) + \
+            (["waves_mem"] if args.dump_mem else ["waves"] if args.dump else [])
+    return "_".join(parts) or "default"
+
+
+def run_verilator(args, simdir, sim_args, vlt_files=(), design_files=frozenset(), cov_types=()):
+    """Build and run one test on Verilator: a UVM bench (a C++ program of
+    the bench and UVM, Verilator's --binary), or a cocotb bench
+    (--cocotb_module: cocotb's own runner builds it and runs a Python test
+    module against it). Without --lib, the tests of one design share one
+    build per kind, sim/<block>/_build/<comp>/<kind>: a build takes minutes,
+    and Verilator rebuilds only what changed."""
     # from PATH: Verilator's own wrapper reads $VERILATOR_BIN (the name of
     # its verilator_bin), so a runner variable of that name made it call
     # itself; a project picks another build by putting it first on PATH
     vbin = shutil.which("verilator")
-    lib = args.lib or "obj_dir"
-    mdir = lib if os.path.isabs(lib) else os.path.join(simdir, lib)
-    binary = os.path.join(mdir, f"V{args.top}")
+    cocotb = bool(args.cocotb_module)
+    uvm_home = None if cocotb else _uvm_home()
+    if args.lib:
+        mdir = args.lib if os.path.isabs(args.lib) else os.path.join(simdir, args.lib)
+    else:
+        mdir = os.path.join(wa_root, "sim", args.block, "_build", args.comp or "default", _build_kind(args))
+    # cocotb's runner names the program after the top (-o <top>)
+    binary = os.path.join(mdir, args.top if cocotb else f"V{args.top}")
+    if not args.run_only:
+        _verilator_build(args, simdir, mdir, binary, vbin, uvm_home, list(vlt_files), design_files,
+                         cov_types, cocotb)
+    if not args.compile_only:
+        run = _verilator_run_cocotb if cocotb else _verilator_run_uvm
+        run(args, simdir, mdir, binary, vbin, uvm_home, sim_args, design_files)
+
+
+def _verilator_build(args, simdir, mdir, binary, vbin, uvm_home, vlt_files, design_files, cov_types, cocotb):
     waves = args.dump or args.dump_mem
-    uvm_home = _uvm_home()
-
-    do_comp = not args.run_only
-    do_sim = not args.compile_only
-
-    if do_comp:
-        if not vbin:
-            print_message("error", "verilator is not on PATH")
-            exit(1)
-        # the wrapper runs $VERILATOR_BIN; naming a wrapper there loops, and
-        # make goes on calling it, so the build never ends
-        if os.path.basename(os.environ.get("VERILATOR_BIN", "")) == "verilator":
-            print_message("error", f"VERILATOR_BIN={os.environ['VERILATOR_BIN']} names a verilator "
-                                   f"wrapper, which then runs itself; unset it (the runner takes "
-                                   f"verilator from PATH)")
-            exit(1)
-        if not uvm_home:
-            print_message("error", "no UVM 1.2 source: set UVM_HOME (the uvm-1.2 directory "
-                                   "that holds src/), or put Questa's vsim on PATH")
-            exit(1)
-        print_message("info", f"Verilator: {vbin}; UVM: {uvm_home}")
+    if not vbin:
+        print_message("error", "verilator is not on PATH")
+        exit(1)
+    # the wrapper runs $VERILATOR_BIN; naming a wrapper there loops, and
+    # make goes on calling it, so the build never ends
+    if os.path.basename(os.environ.get("VERILATOR_BIN", "")) == "verilator":
+        print_message("error", f"VERILATOR_BIN={os.environ['VERILATOR_BIN']} names a verilator "
+                               f"wrapper, which then runs itself; unset it (the runner takes "
+                               f"verilator from PATH)")
+        exit(1)
+    if not cocotb and not uvm_home:
+        print_message("error", "no UVM 1.2 source: set UVM_HOME (the uvm-1.2 directory "
+                               "that holds src/), or put Questa's vsim on PATH")
+        exit(1)
+    print_message("info", f"Verilator: {vbin}; "
+                          + (f"cocotb module: {args.cocotb_module}" if cocotb else f"UVM: {uvm_home}")
+                          + f"; build: {mdir}")
+    os.makedirs(os.path.dirname(mdir), exist_ok=True)
+    # one build at a time in a build folder: two tests of a design that
+    # start together would write the same objects
+    with open(f"{mdir}.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if args.clean:
+            shutil.rmtree(mdir, ignore_errors=True)
         os.makedirs(mdir, exist_ok=True)
+        old = _read_build_record(mdir)
         # a failed build must not leave the last good one to run
         for stale in (binary, os.path.join(mdir, _BUILD_RECORD)):
             try:
                 os.remove(stale)
             except OSError:
                 pass
-        dpi = _uvm_dpi_source(mdir, uvm_home)
-        sources = [f"+incdir+{uvm_home}/src", f"{uvm_home}/src/uvm_pkg.sv", "-f", "comp_filelist.f"]
-        opts, record = [], {"verilator": vbin, "waves": None, "coverage": False}
+        # the file list beside the build, so its path is the same for every
+        # test that builds there (Verilator then sees nothing changed)
+        filelist = os.path.join(mdir, "comp_filelist.f")
+        shutil.copyfile(f"{simdir}/comp_filelist.f", filelist)
+        record = {"verilator": vbin, "bench": "cocotb" if cocotb else "uvm",
+                  "waves": None, "coverage": False, "warnings": []}
+        opts = []
+        if cocotb:
+            sources = ["-f", filelist]
+        else:
+            dpi = _uvm_dpi_source(mdir, uvm_home)
+            sources = [f"+incdir+{uvm_home}/src", f"{uvm_home}/src/uvm_pkg.sv", "-f", filelist]
         if waves:
-            # FST is smaller, but Verilator's FST writer needs lz4.h (liblz4-dev)
-            fmt = "fst" if os.path.exists("/usr/include/lz4.h") else "vcd"
+            if cocotb:
+                # cocotb's runner adds --trace, and cocotb's main writes dump.vcd
+                fmt = "vcd"
+            else:
+                # FST is smaller, but Verilator's FST writer needs lz4.h (liblz4-dev)
+                fmt = "fst" if os.path.exists("/usr/include/lz4.h") else "vcd"
+                opts += [f"--trace-{fmt}"]
+                sources.append(_waves_source(mdir, args.top, args.dut, fmt))
             # wide buses whole (the default stops at 256 bits), structs by field
-            opts += [f"--trace-{fmt}", "--trace-structs", "--trace-max-width", "65536"]
+            opts += ["--trace-structs", "--trace-max-width", "65536"]
             if args.dump_mem:
                 opts += ["--trace-max-array", "65536"]  # the default stops at 32 entries
-            sources.append(_waves_source(mdir, args.top, args.dut, fmt))
-            record.update(waves=fmt, waves_scope=args.dut)
+            record.update(waves=fmt, waves_scope=None if cocotb else args.dut)
         if args.codecov:
             files = _source_files(vbin, [*sources, "--top-module", args.top], simdir)
             if files is None:
                 print_message("error", "Verilator's preprocessor failed, so the files to cover "
                                        "are unknown (see the build below without --codecov)")
                 exit(1)
-            opts += ["--coverage"]
+            opts += _coverage_switches(cov_types)
             skip_dirs = [uvm_home, _verilator_include(vbin)]
             vlt_files = [_coverage_vlt(mdir, files, design_files, skip_dirs), *vlt_files]
             record["coverage"] = True
-        # the CPUs this process may use: all of them here, the job's under Slurm
-        jobs = len(os.sched_getaffinity(0))
-        comp_cmd = [vbin, "--binary", "--timing", "--vpi", "-j", str(jobs),
-                    "-Wno-fatal", "-Wno-lint", "-Wno-style", *opts, *vlt_files, *sources, dpi,
-                    "--top-module", args.top, "--Mdir", mdir]
+        if cocotb:
+            # the bench's own switches (warnings, assertions, X) come from its
+            # config.yaml, through the file list
+            spec = {"sources": [], "build_args": [*opts, *vlt_files, *sources],
+                    "hdl_toplevel": args.top, "build_dir": mdir, "waves": bool(waves)}
+            comp_cmd = ["python3", _COCOTB_RUN, "build", json.dumps(spec)]
+        else:
+            # the CPUs this process may use: all of them here, the job's under Slurm
+            jobs = len(os.sched_getaffinity(0))
+            comp_cmd = [vbin, "--binary", "--timing", "--vpi", "-j", str(jobs),
+                        "-Wno-fatal", "-Wno-lint", "-Wno-style", *opts, *vlt_files, *sources, dpi,
+                        "--top-module", args.top, "--Mdir", mdir]
         r = _run_logged(comp_cmd, simdir, f"{simdir}/comp.log")
-        waive = vlt_comp_waive + [rf"^%Warning-\S+: {re.escape(uvm_home)}/"]
+        waive = vlt_comp_waive + ([rf"^%Warning-\S+: {re.escape(uvm_home)}/"] if uvm_home else [])
         status = parse_log(f"{simdir}/comp.log", vlt_comp_passed, vlt_comp_warn, vlt_comp_fail, waive, False, True)
         if (r or status in ("FAILED", "UNKNOWN") or (status == "PASSED_WARN" and args.pedant)
                 or not os.access(binary, os.X_OK)):
             print_message('error', "Compilation Failed")
             print_message('error', f"LOG:  {simdir}/comp.log")
             exit(1)
+        with open(f"{simdir}/comp.log", errors="replace") as f:
+            text = f.read()
+        record["warnings"] = [ln for ln in text.splitlines() if re.match(r"%Warning", ln)
+                              and not any(re.search(w, ln) for w in waive)]
+        # Verilator skips a build whose inputs did not change and then prints
+        # no warning: the last real build's warnings stay with the build
+        if re.search(r"Built from [\d.]+ MB sources in 0 modules", text):
+            record["warnings"] = old.get("warnings", [])
         with open(os.path.join(mdir, _BUILD_RECORD), "w") as f:
             json.dump(record, f, indent=1)
 
-    if do_sim:
-        if not os.access(binary, os.X_OK):
-            print_message('error', f"no Verilator build at {binary}: its build failed or "
-                                   f"never ran (see comp.log beside it)")
-            exit(1)
-        record = _read_build_record(mdir)
-        if waves and not record.get("waves"):
-            print_message('error', f"the build at {mdir} has no waves: build it with --dump")
-            exit(1)
-        if args.codecov and not record.get("coverage"):
-            print_message('error', f"the build at {mdir} has no coverage: build it with --codecov")
-            exit(1)
-        if waves and record.get("waves_scope") != args.dut:
-            print_message('warning', f"the build dumps {record.get('waves_scope')}, not {args.dut}")
-        if not os.environ.get("VERILATOR_SOLVER") and not shutil.which("z3"):
-            print_message("warning", "VERILATOR_SOLVER is not set and z3 is not on PATH, so "
-                                     "randomize() with constraints fails")
-        # Verilator wants a seed of 1 or more, so test_runner's seed N is
-        # Verilator's N+1; it is a different random stream from Questa's
-        # -sv_seed N in any case
-        vseed = args.seed + 1
-        run_cmd = [binary, f"+verilator+seed+{vseed}"]
-        if waves:
-            run_cmd.append("+vlsi_runners_waves")
-        if args.codecov:
-            run_cmd.append(f"+verilator+coverage+file+{simdir}/coverage.dat")
-        if args.uvm_test:
-            run_cmd += [f"+UVM_TESTNAME={args.uvm_test}", f"+UVM_MAX_QUIT_COUNT={args.uvm_max_quit}",
-                        f"+UVM_VERBOSITY={args.verbosity}"]
-        run_cmd += shlex.split(sim_args)
-        # a program's stdout to a pipe is block-buffered, which would hold the
-        # whole log until exit; line-buffered, regr_runner sees $finish live
-        if shutil.which("stdbuf"):
-            run_cmd = ["stdbuf", "-oL", "-eL"] + run_cmd
-        expect = getattr(args, "expect_fail", None)
-        # as in run_modelsim: an old log or coverage database must not
-        # answer for this run
-        stale = (["run.log"] if expect else []) + (["coverage.dat", "coverage.txt"] if args.codecov else [])
-        for name in stale:
-            try:
-                os.remove(f"{simdir}/{name}")
-            except OSError:
-                pass
-        header = [f"[test_runner] Verilator seed {vseed} (+verilator+seed+{vseed}) for "
-                  f"--seed {args.seed}; not the random stream of Questa's -sv_seed {args.seed}"]
-        r = _run_logged(run_cmd, simdir, f"{simdir}/run.log", header)
-        if r and not expect:
-            print_message('error', f"Simulation Failed {r}")
-            exit(1)
-        status = parse_log(f"{simdir}/run.log", vlt_sim_passed, vlt_sim_warn, vlt_sim_fail, vlt_sim_waive, True, True)
-        print("---")
-        print(f"LOG:  {simdir}/run.log")
-        if waves:
-            print(f"DUMP: {simdir}/waves.{record['waves']}")
-        if args.codecov:
-            dat = f"{simdir}/coverage.dat"
-            if os.path.exists(dat):
-                skip_dirs = [uvm_home, _verilator_include(record.get("verilator") or vbin or "verilator")]
-                _keep_counted_coverage(dat, simdir, design_files, skip_dirs)
-                table = coverage_table(dat)
-                with open(f"{simdir}/coverage.txt", "w") as f:
-                    f.write("\n".join(table) + "\n")
-                print("\n".join(table))
-                print(f"COV:  {dat}")
-            else:
-                print_message("warning", "the simulation saved no coverage database")
-        _exit_on_verdict(args, simdir, r, status)
+
+def _check_build(args, mdir, binary, record, cocotb):
+    """Stop when the build cannot run this test: none there, a bench of the
+    other kind, or no waves or coverage that the test asks for."""
+    if not os.access(binary, os.X_OK):
+        print_message('error', f"no Verilator build at {binary}: its build failed or "
+                               f"never ran (see comp.log beside it)")
+        exit(1)
+    if record.get("bench", "uvm") != ("cocotb" if cocotb else "uvm"):
+        print_message('error', f"the build at {mdir} is for a {record.get('bench')} bench")
+        exit(1)
+    if (args.dump or args.dump_mem) and not record.get("waves"):
+        print_message('error', f"the build at {mdir} has no waves: build it with --dump")
+        exit(1)
+    if args.codecov and not record.get("coverage"):
+        print_message('error', f"the build at {mdir} has no coverage: build it with --codecov")
+        exit(1)
+
+
+def _remove(simdir, names):
+    for name in names:
+        try:
+            os.remove(f"{simdir}/{name}")
+        except OSError:
+            pass
+
+
+def _report_coverage(simdir, design_files, skip_dirs):
+    """Keep the points that count in the run's coverage.dat, then write and
+    print its totals table (coverage.txt)."""
+    dat = f"{simdir}/coverage.dat"
+    if not os.path.exists(dat):
+        print_message("warning", "the simulation saved no coverage database")
+        return
+    _keep_counted_coverage(dat, simdir, design_files, skip_dirs)
+    table = coverage_table(dat)
+    with open(f"{simdir}/coverage.txt", "w") as f:
+        f.write("\n".join(table) + "\n")
+    print("\n".join(table))
+    print(f"COV:  {dat}")
+
+
+def _verilator_run_uvm(args, simdir, mdir, binary, vbin, uvm_home, sim_args, design_files):
+    waves = args.dump or args.dump_mem
+    record = _read_build_record(mdir)
+    _check_build(args, mdir, binary, record, cocotb=False)
+    if waves and record.get("waves_scope") != args.dut:
+        print_message('warning', f"the build dumps {record.get('waves_scope')}, not {args.dut}")
+    if not os.environ.get("VERILATOR_SOLVER") and not shutil.which("z3"):
+        print_message("warning", "VERILATOR_SOLVER is not set and z3 is not on PATH, so "
+                                 "randomize() with constraints fails")
+    # Verilator wants a seed of 1 or more, so test_runner's seed N is
+    # Verilator's N+1; it is a different random stream from Questa's
+    # -sv_seed N in any case
+    vseed = args.seed + 1
+    run_cmd = [binary, f"+verilator+seed+{vseed}"]
+    if waves:
+        run_cmd.append("+vlsi_runners_waves")
+    if args.codecov:
+        run_cmd.append(f"+verilator+coverage+file+{simdir}/coverage.dat")
+    if args.uvm_test:
+        run_cmd += [f"+UVM_TESTNAME={args.uvm_test}", f"+UVM_MAX_QUIT_COUNT={args.uvm_max_quit}",
+                    f"+UVM_VERBOSITY={args.verbosity}"]
+    run_cmd += shlex.split(sim_args)
+    # a program's stdout to a pipe is block-buffered, which would hold the
+    # whole log until exit; line-buffered, regr_runner sees $finish live
+    if shutil.which("stdbuf"):
+        run_cmd = ["stdbuf", "-oL", "-eL"] + run_cmd
+    expect = getattr(args, "expect_fail", None)
+    # as in run_modelsim: an old log or coverage database must not answer
+    # for this run
+    _remove(simdir, (["run.log"] if expect else []) + (["coverage.dat", "coverage.txt"] if args.codecov else []))
+    header = [f"[test_runner] Verilator seed {vseed} (+verilator+seed+{vseed}) for "
+              f"--seed {args.seed}; not the random stream of Questa's -sv_seed {args.seed}"]
+    r = _run_logged(run_cmd, simdir, f"{simdir}/run.log", header)
+    if r and not expect:
+        print_message('error', f"Simulation Failed {r}")
+        exit(1)
+    status = parse_log(f"{simdir}/run.log", vlt_sim_passed, vlt_sim_warn, vlt_sim_fail, vlt_sim_waive, True, True)
+    print("---")
+    print(f"LOG:  {simdir}/run.log")
+    if waves:
+        print(f"DUMP: {simdir}/waves.{record['waves']}")
+    if args.codecov:
+        _report_coverage(simdir, design_files,
+                         [uvm_home, _verilator_include(record.get("verilator") or vbin or "verilator")])
+    _exit_on_verdict(args, simdir, r, status)
+
+
+def _cocotb_results(path):
+    """(the tests run, the failed ones with their message) from a cocotb results.xml."""
+    try:
+        root = ET.parse(path).getroot()
+    except (OSError, ET.ParseError):
+        return 0, []
+    n, failed = 0, []
+    for case in root.iter("testcase"):
+        n += 1
+        for bad in list(case.iter("failure")) + list(case.iter("error")):
+            failed.append(f"{case.get('name')}: {bad.get('message') or bad.text or 'failed'}".strip())
+    return n, failed
+
+
+def _verilator_run_cocotb(args, simdir, mdir, binary, vbin, uvm_home, sim_args, design_files):
+    """Run one cocotb test against its build. The verdict, as cocotb benches
+    had it in their own run.py: a failed test in results.xml, no test run,
+    a `%Error` or ERROR line in the log (an assertion prints one while
+    results.xml may still call the test a pass), or a runner that ended
+    badly fails it; a `%Warning` or WARNING line, in the run or in its
+    build, makes it pass with warnings (so --pedant fails it)."""
+    waves = args.dump or args.dump_mem
+    record = _read_build_record(mdir)
+    _check_build(args, mdir, binary, record, cocotb=True)
+    test = args.cocotb_test or args.test
+    vseed = args.seed + 1  # Verilator draws a new seed for 0
+    # sim_args come most specific first (the command line, then tests.yaml,
+    # then config.yaml), since $value$plusargs takes the first match;
+    # cocotb.plusargs keeps the last one, so a cocotb run gets them reversed
+    plusargs = [f"+verilator+seed+{vseed}", *reversed(shlex.split(sim_args))]
+    if args.codecov:
+        plusargs.append(f"+verilator+coverage+file+{simdir}/coverage.dat")
+    spec = {"pythonpath": [os.path.join(wa_root, "verif", args.block)],
+            "test_module": args.cocotb_module, "hdl_toplevel": args.top, "hdl_toplevel_lang": "verilog",
+            "testcase": test, "seed": args.seed,
+            # the runner's own filter for a name is `.*<name>$`, which would
+            # take `reorder` for `order`
+            "test_filter": rf"\.{re.escape(test)}$",
+            "plusargs": plusargs, "build_dir": mdir, "test_dir": simdir,
+            "results_xml": f"{simdir}/results.xml", "waves": bool(waves)}
+    expect = getattr(args, "expect_fail", None)
+    _remove(simdir, ["results.xml", "dump.vcd"] + (["run.log"] if expect else [])
+            + (["coverage.dat", "coverage.txt"] if args.codecov else []))
+    # the test's Python and the program write their lines as they come
+    os.environ["PYTHONUNBUFFERED"] = "1"
+    run_cmd = ["python3", _COCOTB_RUN, "test", json.dumps(spec)]
+    if shutil.which("stdbuf"):
+        run_cmd = ["stdbuf", "-oL", "-eL"] + run_cmd
+    header = [f"[test_runner] cocotb test {test} of {args.cocotb_module}, cocotb seed {args.seed}, "
+              f"Verilator seed {vseed} (+verilator+seed+{vseed})"]
+    r = _run_logged(run_cmd, simdir, f"{simdir}/run.log", header)
+    n, failed = _cocotb_results(f"{simdir}/results.xml")
+    with open(f"{simdir}/run.log", errors="replace") as f:
+        lines = f.read().splitlines()
+    errors = [ln for ln in lines if "%Error" in ln or re.search(r"\bERROR\b", ln)]
+    warnings = [ln for ln in lines if "%Warning" in ln or re.search(r"\bWARNING\b", ln)]
+    warnings += record.get("warnings", [])
+    why = [f"{len(errors)} error line(s) in the log, the first: {errors[0].strip()}"] if errors else []
+    if n == 0:
+        why.append(f"no test ran: is there a test '{test}' in {args.cocotb_module}?")
+    why += failed
+    if r and not why:
+        why.append(f"the cocotb runner ended with exit code {r}")
+    status = "FAILED" if why else "PASSED_WARN" if warnings else "PASSED"
+    print_test_status(status)
+    for w in why:
+        print_message('error', w)
+    if status == "PASSED_WARN":
+        print_message('warning', f"{len(warnings)} warning(s), the first: {warnings[0].strip()}")
+    print("---")
+    print(f"LOG:  {simdir}/run.log")
+    if waves:
+        print(f"DUMP: {simdir}/dump.vcd")
+    if args.codecov:
+        _report_coverage(simdir, design_files, [_verilator_include(record.get("verilator") or vbin or "verilator")])
+    _exit_on_verdict(args, simdir, r if why else 0, status)
 
 
 def source_project_env():
@@ -840,18 +1023,19 @@ def generate_sim_command(args):
         shutil.rmtree(simdir, ignore_errors=True)
     os.makedirs(simdir, exist_ok=True)
 
-    sim_args, design_files, vlt_files = _gather_attrs_and_filelist(args, simdir)
+    sim_args, design_files, vlt_files, cov_types = _gather_attrs_and_filelist(args, simdir)
 
     if args.simulator == "vcs":
         run_vcs(args, simdir, sim_args)
     elif args.simulator == "verilator":
-        run_verilator(args, simdir, sim_args, vlt_files, design_files)
+        run_verilator(args, simdir, sim_args, vlt_files, design_files, cov_types)
     else:
         run_modelsim(args, simdir, sim_args, design_files)
 
 
 def parse_test_args(block, test):
-    """Retrieve compilation and simulation arguments for a specific test."""
+    """Retrieve compilation and simulation arguments for a specific test, and
+    the name of its compilation."""
     block_dir = f"{wa_root}/verif/{block}"
     tests_config = f"{block_dir}/lib/tests.yaml"
     print_message("info", f"Parsing Tests config YAML - {tests_config}")
@@ -891,7 +1075,7 @@ def parse_test_args(block, test):
         assert isinstance(value, list), f"{attrib} must be a list"
         additional_args += value
 
-    return [word for item in additional_args for word in item.split()]
+    return [word for item in additional_args for word in item.split()], test_context['comp']
 
 
 
@@ -960,14 +1144,19 @@ def main():
                         "design's RTL; writes coverage.ucdb and coverage.txt in the run directory")
     parser.add_argument("--sim_args", action="append", nargs="*", help="Command arguments to pass to simulation process")
     parser.add_argument("--comp_args", action="append", nargs="*", help="Command arguments to pass to compilation process")
+    parser.add_argument("--cocotb_module", type=str, help="A cocotb bench (--simulator verilator only): the "
+                        "Python module with its tests, found in verif/<block>/. cocotb's runner then builds "
+                        "the design and runs one test of the module (see README 'cocotb benches')")
+    parser.add_argument("--cocotb_test", type=str, help="The cocotb test of --cocotb_module to run "
+                        "(default: the test's name in tests.yaml)")
 
     original_args = sys.argv[1:]
     args = parser.parse_args()
 
-    expect_fail = None
+    expect_fail, comp = None, None
     if args.test:
         expect_fail = test_expectation(args.block, args.test)
-        additional_args = parse_test_args(args.block, args.test)
+        additional_args, comp = parse_test_args(args.block, args.test)
         # A CLI --uvm_test overrides the one baked into tests.yaml (yaml args are
         # appended last and would otherwise win), so a custom test can run against an
         # existing net's compilation, e.g. --uvm_test cn_directed_example.
@@ -984,6 +1173,10 @@ def main():
     # AFTER the re-parse above, which builds a fresh namespace and would drop
     # anything set on the old one (open item 50)
     args.expect_fail = expect_fail
+    args.comp = comp
+    if args.cocotb_module and args.simulator != "verilator":
+        print_message("error", "--cocotb_module: a cocotb bench runs with --simulator verilator only")
+        exit(1)
 
     if args.dut is None:
         args.dut = args.top
