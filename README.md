@@ -62,7 +62,7 @@ close. A block tree without a `design` block, such as a VIP's own bench, covers 
 | run | what you get |
 |---|---|
 | `test_runner ... --codecov` | the totals table on the console, `coverage.txt` and `coverage.ucdb` in the run directory (`coverage save -instance <--dut>`) |
-| `regr_runner ... --codecov` | per block: `merged.ucdb`, `coverage.txt` (also appended to `summary.txt`) and `coverage_html/index.html` under `sim/regression/<name>/<block>/` |
+| `regr_runner ... --codecov` | per block, from the passing runs only: `merged.ucdb`, `coverage.txt` (also appended to `summary.txt`) and `coverage_html/index.html` under `sim/regression/<name>/<block>/` |
 
 To browse a database in the GUI: `vsim -viewcov <file>.ucdb`. To exclude something
 from the figures, `vcover` and the GUI's exclusion commands apply to the merged file.
@@ -159,7 +159,7 @@ program still runs. Its output goes to `run.log`.
   preprocessor lists every file of the build, and a generated `.vlt` file turns coverage
   off in each one that is not a `design` block's (and always in UVM). Without a `design`
   block, everything but UVM counts. The run writes `coverage.dat` and the totals table
-  `coverage.txt` in the run directory. `regr_runner` merges each block's databases with
+  `coverage.txt` in the run directory. `regr_runner` merges each block's passing runs with
   `verilator_coverage` into `merged.dat`, writes `coverage.txt` (also appended to
   `summary.txt`), and makes `coverage_html/index.html` with `genhtml` (package `lcov`).
   Do not rely on the `fsm_state` and `fsm_arc` rows yet. Verilator's FSM coverage is new:

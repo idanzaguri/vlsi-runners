@@ -813,8 +813,14 @@ def summarize_results(results, summary_path, total_tests, start_time, pedant=Fal
     with open(summary_path, "w") as summary_file:
         summary_file.write(summary_content)
 
-def merge_coverage(regression_dir, simulator="modelsim"):
-    """Merge every member's coverage database, one merged file per block,
+def _passing_files(block_dir, name, passed_dirs):
+    """The coverage databases (``name``) of a block's passing runs: a failed
+    run's coverage does not count."""
+    return sorted(f for f in block_dir.glob(f"**/{name}") if f.parent in passed_dirs)
+
+
+def merge_coverage(regression_dir, simulator="modelsim", passed_dirs=None):
+    """Merge the passing members' coverage databases, one merged file per block,
     and report on it.
 
     A block is one design, so the merge stops at the block: adding two
@@ -827,14 +833,16 @@ def merge_coverage(regression_dir, simulator="modelsim"):
     fatal: the regression's verdict is already in. Verilator's databases
     (coverage.dat) are merged with verilator_coverage instead (see
     :func:`merge_verilator_coverage`)."""
+    passed_dirs = set(passed_dirs) if passed_dirs is not None else None
     if simulator == "verilator":
-        return merge_verilator_coverage(regression_dir)
+        return merge_verilator_coverage(regression_dir, passed_dirs)
     tables = {}
     for block_dir in sorted(regression_dir.iterdir()):
         # `_build` holds the shared design libraries, not a block's runs
         if not block_dir.is_dir() or block_dir.name.startswith("_"):
             continue
-        ucdb_files = sorted(block_dir.glob("**/coverage.ucdb"))
+        ucdb_files = (_passing_files(block_dir, "coverage.ucdb", passed_dirs) if passed_dirs is not None
+                      else sorted(block_dir.glob("**/coverage.ucdb")))
         if not ucdb_files:
             continue
         merged = block_dir / "merged.ucdb"
@@ -877,7 +885,7 @@ def _verilator_coverage_bin(regression_dir):
     return shutil.which("verilator_coverage") or "verilator_coverage"
 
 
-def merge_verilator_coverage(regression_dir):
+def merge_verilator_coverage(regression_dir, passed_dirs=None):
     """The Verilator form of :func:`merge_coverage`: per block, every
     member's coverage.dat merged into ``merged.dat``, the totals table in
     ``coverage.txt``, and ``coverage_html/`` from genhtml (through the lcov
@@ -888,7 +896,8 @@ def merge_verilator_coverage(regression_dir):
     for block_dir in sorted(regression_dir.iterdir()):
         if not block_dir.is_dir() or block_dir.name.startswith("_"):
             continue
-        dat_files = sorted(block_dir.glob("**/coverage.dat"))
+        dat_files = (_passing_files(block_dir, "coverage.dat", passed_dirs) if passed_dirs is not None
+                     else sorted(block_dir.glob("**/coverage.dat")))
         if not dat_files:
             continue
         merged = block_dir / "merged.dat"
@@ -1255,7 +1264,8 @@ def main():
     pbar.close() 
     print()
     if args.codecov:
-        report_coverage(merge_coverage(regression_dir, args.simulator), regression_dir,
+        passed_dirs = [Path(t[4]).parent for t in results if t[3] in ("PASSED", "PASSED_WARN")]
+        report_coverage(merge_coverage(regression_dir, args.simulator, passed_dirs), regression_dir,
                         regression_dir / "summary.txt")
     hooks_failed = run_hooks(settings["hooks"], regression_dir, results, args.codecov,
                              regression_dir / "summary.txt") if settings["hooks"] else 0
