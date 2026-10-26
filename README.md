@@ -133,10 +133,17 @@ The build is
   [verilator/uvm12_dpi/](verilator/uvm12_dpi/README.md) over it. With it,
   `uvm_hdl_force` and `uvm_hdl_read` work through VPI. A signal that a test forces needs
   `forceable` and `public_flat_rw` in a `.vlt` file.
-- `-j` is the number of CPUs that the process may use: all of them on the local machine,
-  and only the job's CPUs under Slurm. A build through `--launcher srun` therefore gets
-  one CPU, unless `--srun_args` asks for more (`--cpus-per-task`, which then applies to
-  the tests too).
+- `-j` is `--build_jobs`, else the number of CPUs that the process may use: all of them
+  on the local machine, the job's under Slurm.
+- In a regression, Verilator builds go `--build_parallel` at a time (default 1), each with
+  `--build_cpus` CPUs (default: the machine's CPUs divided by `--build_parallel`). Under
+  `--launcher srun` a build job asks Slurm for `--build_cpus` CPUs; a test job asks for one.
+  One build with all 12 CPUs of lab-lnx took about 8.4 GB of RAM on a logion_tb bench, so
+  more builds at once can run out of memory (logion_tb issue 24).
+- A regression's builds are pruned when they succeed (`--prune_build`): the precompiled
+  headers (`*.gch`), objects and libraries go, the program stays. A logion_tb build folder
+  goes from 677 to 799 MB to about 25 MB. A `test_runner` run keeps its shared build whole,
+  so the next build of it only relinks.
 - In `comp.log`, `%Error`, `make: ***` and compiler `error:` lines fail the build.
   `%Warning` lines are warnings, except the warnings inside `$UVM_HOME`.
 

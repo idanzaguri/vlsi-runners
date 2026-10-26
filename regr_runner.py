@@ -297,15 +297,18 @@ class _SlurmJob:
         self.host = self.job_id = self.sid = None
         self.started_at = None  # when the start line arrived
 
-    def command(self, cmd_args, minutes=None):
+    def command(self, cmd_args, minutes=None, cpus=None):
         """srun, its options, then ``cmd_args``. ``minutes`` is Slurm's own
         time limit for the job, which ends it if the runner is no longer
-        there to; a --time in --srun_args wins. Only the options the runner
-        needs are set here, since srun gives a mixed result for an option
-        given twice."""
+        there to; ``cpus`` the CPUs it asks for (a Verilator build). A
+        --time or --cpus-per-task in --srun_args wins. Only the options the
+        runner needs are set here, since srun gives a mixed result for an
+        option given twice."""
         cmd = ["srun", f"--job-name={self.name}", "--input=none", "--unbuffered", "--quit-on-interrupt"]
         if minutes and not any(a.startswith(("-t", "--time")) for a in srun_args):
             cmd.append(f"--time={minutes}")
+        if cpus and not any(a.startswith(("-c", "--cpus-per-task")) for a in srun_args):
+            cmd.append(f"--cpus-per-task={cpus}")
         return cmd + srun_args + ["python3", "-c", _SRUN_TASK] + cmd_args
 
     def saw(self, line):
@@ -586,20 +589,27 @@ def expect_fail_of(block, test):
     return _xfail_cache.get(block, {}).get(test)
 
 
-def build_lib(block, comp, test, build_dir, codecov=False, simulator="modelsim"):
-    """Compile and optimize one design ONCE, into its own work library."""
+def build_lib(block, comp, test, build_dir, codecov=False, simulator="modelsim", build_cpus=None):
+    """Compile and optimize one design ONCE, into its own work library.
+
+    A Verilator build gets ``build_cpus`` (its make -j, and under srun the
+    CPUs its job asks for) and is pruned after it succeeds: its headers and
+    objects are most of its folder, and only the program runs."""
     build_dir.mkdir(parents=True, exist_ok=True)
     cmd = (f"{sys.executable} {_TEST_RUNNER} --block {block} --test {test} "
            f"--compile-only --rundir {build_dir} --simulator {simulator}")
     if simulator == "verilator":
         # the regression's own build, which its tests then run (--lib); test_runner
         # alone shares one under sim/<block>/_build/
-        cmd += f" --lib {build_dir / 'obj_dir'}"
+        cmd += f" --lib {build_dir / 'obj_dir'} --prune_build"
+        if build_cpus:
+            cmd += f" --build_jobs {build_cpus}"
     if codecov:
         cmd += " --codecov"
     cmd_args = shlex.split(cmd)
     if launcher == "srun":
-        cmd_args = _SlurmJob(f"build.{comp}").command(cmd_args)
+        cmd_args = _SlurmJob(f"build.{comp}").command(
+            cmd_args, cpus=build_cpus if simulator == "verilator" else None)
     r = subprocess.run(cmd_args, capture_output=True, text=True,
                        stdin=subprocess.DEVNULL if launcher == "srun" else None)
     ok = r.returncode == 0
@@ -987,6 +997,8 @@ def main():
     parser.add_argument("--finish_grace", type=int, default=60, help="Seconds a simulator may keep running after $finish (coverage save, quit) before it is killed and the test judged from its output; 0 waits for --timeout instead (default: 60)")
     parser.add_argument("--reruns", type=int, default=1, help="How many times a test whose simulator stopped before $finish for a reason that is not the test's (killed at --timeout, or its license process failed) is rerun with the same seed before it counts as FAILED; 0 never reruns (default: 1)")
     parser.add_argument("--simulator", type=str, choices=["modelsim", "vcs", "verilator"], default="modelsim", help="Simulator to use for every test in the regression (default: modelsim). With verilator, each design is built once (minutes) and every test runs the built program (see README 'Verilator')")
+    parser.add_argument("--build_parallel", type=int, default=1, help="Verilator only: how many designs build at once (default: 1). A build with all 12 CPUs of lab-lnx took about 8.4 GB of RAM on a logion_tb bench, so several at once can run out of memory")
+    parser.add_argument("--build_cpus", type=int, help="Verilator only: the CPUs of one build, its make -j, and under --launcher srun the CPUs its job asks for (default: this machine's CPUs divided by --build_parallel)")
     parser.add_argument("--no-shared-lib", action="store_true", help="Compile and optimize inside every test, as before the shared design libraries (slower; use if a library build is in the way)")
     parser.add_argument("--launcher", choices=["local", "srun"], default="local", help="Where each design build and test runs: local runs it on this machine; srun runs it through Slurm, which picks a machine with a free slot and queues it until there is one. The work area must have the same path on every machine (see README 'Tests on other machines'). With srun, --max_parallel is how many tests the runner hands to Slurm at once, and --timeout counts from the moment a test starts on its machine (default: local)")
     parser.add_argument("--srun_args", type=str, default="", help="Extra srun options for every build and test with --launcher srun, as one string, e.g. \"--constraint=questa\" to keep Questa runs on the machines that have a Questa license. Never --job-name: the runner names each job itself (default: none)")
@@ -1109,12 +1121,20 @@ def main():
         if wanted:
             print_message("info", f"building {len(wanted)} design librar"
                                   f"{'y' if len(wanted) == 1 else 'ies'} once")
+            # Verilator builds take all the CPUs and gigabytes each, so they
+            # go --build_parallel at a time; a Questa build is light
+            verilator = args.simulator == "verilator"
+            build_cpus = (args.build_cpus or max(1, (os.cpu_count() or 1) // max(1, args.build_parallel))
+                          if verilator else None)
+            if verilator:
+                print_message("info", f"Verilator builds: {args.build_parallel} at a time, "
+                                      f"{build_cpus} CPUs each")
             with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=args.max_parallel) as pool:
+                    max_workers=args.build_parallel if verilator else args.max_parallel) as pool:
                 jobs = [pool.submit(build_lib, b, c,
                                     wanted[(b, c)],
                                     regression_dir / "_build" / b / c,
-                                    args.codecov, args.simulator)
+                                    args.codecov, args.simulator, build_cpus)
                         for (b, c) in wanted]
                 for job in tqdm(concurrent.futures.as_completed(jobs),
                                 total=len(jobs), desc="compiling",

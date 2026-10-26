@@ -10,7 +10,8 @@ cocotb release is the project's. cocotb_tools.runner keeps cocotb's build
 recipe (its verilator.cpp, its VPI library, -cc --exe --vpi
 --public-flat-rw) and sets the environment a test needs (COCOTB_TEST_MODULES,
 the seed, PYTHONPATH from sys.path). The JSON holds the keyword arguments
-of Runner.build or Runner.test; "pythonpath" is put first on sys.path.
+of Runner.build or Runner.test; "pythonpath" is put first on sys.path, and
+"jobs" is the build's make -j.
 
 Output goes to stdout (test_runner writes it to comp.log or run.log). The
 exit code is 0 when the runner finished, 1 when it raised: a failed build,
@@ -28,7 +29,14 @@ def main(argv):
         return 2
     kwargs = json.loads(argv[2])
     sys.path[:0] = kwargs.pop("pythonpath", [])
+    jobs = kwargs.pop("jobs", None)
+    import cocotb_tools.runner
     from cocotb_tools.runner import get_runner
+    # the runner's make -j is cpu_count(), which ignores the CPUs a Slurm job
+    # has, and it takes no argument for it; set it where the runner reads it
+    # (a private function of cocotb 2.1: without it, cocotb's own count stays)
+    if jobs and hasattr(cocotb_tools.runner, "_get_max_parallel_build_jobs"):
+        cocotb_tools.runner._get_max_parallel_build_jobs = lambda: jobs
     runner = get_runner("verilator")
     try:
         if argv[1] == "build":

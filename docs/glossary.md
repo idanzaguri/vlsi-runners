@@ -172,6 +172,15 @@ runner reports them so two forms of one design can be compared.
 - **hooks.log**: each hook's command, output and exit code, in the
   regression's folder.
 - **--list**: regr_runner prints the runs of a regression and exits.
+- **--build_parallel, --build_cpus**: how many Verilator builds a regression
+  runs at once, and the CPUs of each (its make -j, and under Slurm the CPUs
+  its job asks for).
+- **--build_jobs**: test_runner's make -j for a Verilator build.
+- **Precompiled header** (`*.gch`): a C++ header the compiler has turned into
+  a file it reads faster. Most of a Verilator build folder.
+- **--prune_build**: test_runner deletes a good build's precompiled headers,
+  objects and libraries; the program stays. regr_runner sets it for its
+  Verilator builds.
 
 ## Tests on other machines (Slurm)
 

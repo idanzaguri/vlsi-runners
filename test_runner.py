@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import fcntl
+import glob
 import json
 import os
 import re
@@ -798,15 +799,16 @@ def _verilator_build(args, simdir, mdir, binary, vbin, uvm_home, vlt_files, desi
             skip_dirs = [uvm_home, _verilator_include(vbin)]
             vlt_files = [_coverage_vlt(mdir, files, design_files, skip_dirs), *vlt_files]
             record["coverage"] = True
+        # make -j: --build_jobs, else the CPUs this process may use (all of them
+        # here, the job's under Slurm)
+        jobs = args.build_jobs or len(os.sched_getaffinity(0))
         if cocotb:
             # the bench's own switches (warnings, assertions, X) come from its
             # config.yaml, through the file list
-            spec = {"sources": [], "build_args": [*opts, *vlt_files, *sources],
+            spec = {"sources": [], "build_args": [*opts, *vlt_files, *sources], "jobs": jobs,
                     "hdl_toplevel": args.top, "build_dir": mdir, "waves": bool(waves)}
             comp_cmd = ["python3", _COCOTB_RUN, "build", json.dumps(spec)]
         else:
-            # the CPUs this process may use: all of them here, the job's under Slurm
-            jobs = len(os.sched_getaffinity(0))
             comp_cmd = [vbin, "--binary", "--timing", "--vpi", "-j", str(jobs),
                         "-Wno-fatal", "-Wno-lint", "-Wno-style", *opts, *vlt_files, *sources, dpi,
                         "--top-module", args.top, "--Mdir", mdir]
@@ -826,8 +828,27 @@ def _verilator_build(args, simdir, mdir, binary, vbin, uvm_home, vlt_files, desi
         # no warning: the last real build's warnings stay with the build
         if re.search(r"Built from [\d.]+ MB sources in 0 modules", text):
             record["warnings"] = old.get("warnings", [])
+        if args.prune_build:
+            _prune_build(mdir)
+            record["pruned"] = True
         with open(os.path.join(mdir, _BUILD_RECORD), "w") as f:
             json.dump(record, f, indent=1)
+
+
+def _prune_build(mdir):
+    """Delete what a good build needs no more: the precompiled headers
+    (*.gch, most of the folder: 577 of 677 to 799 MB on a logion_tb bench),
+    the objects and the libraries. The program and the sources stay; a
+    later build of the folder compiles everything again (ccache helps)."""
+    freed = 0
+    for pattern in ("*.gch", "*.o", "*.a"):
+        for path in glob.glob(os.path.join(mdir, pattern)):
+            try:
+                freed += os.path.getsize(path)
+                os.remove(path)
+            except OSError:
+                pass
+    print_message("info", f"pruned the build: {freed / 1e6:.0f} MB of headers and objects deleted")
 
 
 def _check_build(args, mdir, binary, record, cocotb):
@@ -1144,6 +1165,11 @@ def main():
                         "design's RTL; writes coverage.ucdb and coverage.txt in the run directory")
     parser.add_argument("--sim_args", action="append", nargs="*", help="Command arguments to pass to simulation process")
     parser.add_argument("--comp_args", action="append", nargs="*", help="Command arguments to pass to compilation process")
+    parser.add_argument("--build_jobs", type=int, help="make -j of a Verilator build (default: the CPUs "
+                        "this process may use: all of them locally, the job's under Slurm)")
+    parser.add_argument("--prune_build", action="store_true", help="After a good Verilator build, delete "
+                        "its precompiled headers, objects and libraries (most of the folder); the program "
+                        "stays. A later build of the folder compiles everything again")
     parser.add_argument("--cocotb_module", type=str, help="A cocotb bench (--simulator verilator only): the "
                         "Python module with its tests, found in verif/<block>/. cocotb's runner then builds "
                         "the design and runs one test of the module (see README 'cocotb benches')")
