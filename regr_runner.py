@@ -11,6 +11,7 @@ import concurrent.futures
 import time
 import shutil
 import shlex
+import json
 import getpass
 import inspect
 import itertools
@@ -22,7 +23,9 @@ import datetime
 from pathlib import Path
 from tqdm import tqdm
 from test_runner import (ms_sim_passed, ms_sim_warn, ms_sim_fail, ms_sim_waive,
-                         vcs_sim_passed, vcs_sim_warn, vcs_sim_fail, vcs_sim_waive)
+                         vcs_sim_passed, vcs_sim_warn, vcs_sim_fail, vcs_sim_waive,
+                         vlt_sim_passed, vlt_sim_warn, vlt_sim_fail, vlt_sim_waive,
+                         coverage_table as vlt_coverage_table)
 
 
 # ----------------------------------------------------------------------
@@ -46,10 +49,11 @@ from test_runner import (ms_sim_passed, ms_sim_warn, ms_sim_fail, ms_sim_waive,
 # ----------------------------------------------------------------------
 
 # The line a simulator prints when $finish runs: Questa's "** Note: $finish
-# : <file>(<line>)", VCS's "$finish called from file ...". Questa flushes
-# its output when the run stops, so the runner reads this line while vsim
-# still lives.
-_FINISH_RE = re.compile(r"\*\* Note: \$finish\b|\$finish called from")
+# : <file>(<line>)", VCS's "$finish called from file ...", Verilator's
+# "- <file>:<line>: Verilog $finish". Questa flushes its output when the run
+# stops, and test_runner runs a Verilator program line-buffered, so the
+# runner reads this line while the simulator still lives.
+_FINISH_RE = re.compile(r"\*\* Note: \$finish\b|\$finish called from|: Verilog \$finish\b")
 
 # What Questa prints when its license machinery fails: vlm itself when it
 # loses the pipe to its vsim ("Read failure in vlm process", "Write failure
@@ -63,6 +67,7 @@ _LICENSE_FAIL_RE = re.compile(r"(Read|Write) failure in vlm process|FATAL ERROR 
 _SIM_LOG_RULES = {
     "modelsim": (ms_sim_passed, ms_sim_warn, ms_sim_fail, ms_sim_waive),
     "vcs": (vcs_sim_passed, vcs_sim_warn, vcs_sim_fail, vcs_sim_waive),
+    "verilator": (vlt_sim_passed, vlt_sim_warn, vlt_sim_fail, vlt_sim_waive),
 }
 
 
@@ -496,7 +501,8 @@ def run_test(block, test, seed, rundir, codecov=False, simulator="modelsim",
                          f"exit code {proc.returncode})")
     else:
         status = "FAILED"
-    if killed and head is not None and codecov and not os.path.exists(os.path.join(rundir, "coverage.ucdb")):
+    cov_db = "coverage.dat" if simulator == "verilator" else "coverage.ucdb"
+    if killed and head is not None and codecov and not os.path.exists(os.path.join(rundir, cov_db)):
         notes.append("no coverage database: the simulator was killed before it saved one")
         note += ", no coverage database"
     if snapshot:
@@ -513,7 +519,7 @@ def run_test(block, test, seed, rundir, codecov=False, simulator="modelsim",
     return block, test, seed, status, time.time() - t_run, note
 
 
-def clean_test_files(rundir, success, keep_patterns = ["test.log", "test.try*.log", "coverage.ucdb"]):
+def clean_test_files(rundir, success, keep_patterns = ["test.log", "test.try*.log", "coverage.ucdb", "coverage.dat"]):
     rundir = Path(rundir)  # Ensure rundir is a Path object.
     if not rundir.is_dir():
         raise ValueError(f"{rundir} is not a valid directory.")
@@ -670,7 +676,7 @@ def summarize_results(results, summary_path, total_tests, start_time, pedant=Fal
     with open(summary_path, "w") as summary_file:
         summary_file.write(summary_content)
 
-def merge_coverage(regression_dir):
+def merge_coverage(regression_dir, simulator="modelsim"):
     """Merge every member's coverage database, one merged file per block,
     and report on it.
 
@@ -681,7 +687,11 @@ def merge_coverage(regression_dir):
     ``merge.log`` holds the tools' own output. Returns ``{block: table}``,
     the table as the lines of coverage.txt, for the blocks that had any
     database to merge. A failed tool step is reported and skipped, never
-    fatal: the regression's verdict is already in."""
+    fatal: the regression's verdict is already in. Verilator's databases
+    (coverage.dat) are merged with verilator_coverage instead (see
+    :func:`merge_verilator_coverage`)."""
+    if simulator == "verilator":
+        return merge_verilator_coverage(regression_dir)
     tables = {}
     for block_dir in sorted(regression_dir.iterdir()):
         # `_build` holds the shared design libraries, not a block's runs
@@ -716,6 +726,59 @@ def merge_coverage(regression_dir):
     return tables
 
 
+def _verilator_coverage_bin(regression_dir):
+    """verilator_coverage of the Verilator that built the designs (each build
+    records its verilator), else the one on PATH."""
+    for record in sorted(regression_dir.glob("_build/*/*/obj_dir/vlsi_runners_build.json")):
+        try:
+            vbin = json.loads(record.read_text()).get("verilator")
+        except (OSError, ValueError):
+            continue
+        cand = os.path.join(os.path.dirname(vbin or ""), "verilator_coverage")
+        if vbin and os.access(cand, os.X_OK):
+            return cand
+    return shutil.which("verilator_coverage") or "verilator_coverage"
+
+
+def merge_verilator_coverage(regression_dir):
+    """The Verilator form of :func:`merge_coverage`: per block, every
+    member's coverage.dat merged into ``merged.dat``, the totals table in
+    ``coverage.txt``, and ``coverage_html/`` from genhtml (through the lcov
+    file ``coverage.info``). Each test already kept only the design's
+    files. Returns ``{block: table}``."""
+    vcov = _verilator_coverage_bin(regression_dir)
+    tables = {}
+    for block_dir in sorted(regression_dir.iterdir()):
+        if not block_dir.is_dir() or block_dir.name.startswith("_"):
+            continue
+        dat_files = sorted(block_dir.glob("**/coverage.dat"))
+        if not dat_files:
+            continue
+        merged = block_dir / "merged.dat"
+        info = block_dir / "coverage.info"
+        print_message("info", f"merging {len(dat_files)} coverage database(s) of {block_dir.name}")
+        steps = [[vcov, "--write", str(merged), *map(str, dat_files)],
+                 [vcov, "--write-info", str(info), str(merged)]]
+        if shutil.which("genhtml"):
+            steps.append(["genhtml", "--quiet", "--output-directory",
+                          str(block_dir / "coverage_html"), str(info)])
+        else:
+            print_message("warning", "genhtml is not on PATH (package lcov), so there is no HTML report")
+        merge_log = block_dir / "merge.log"
+        with open(merge_log, "w") as log_file:
+            for cmd in steps:
+                r = subprocess.run(cmd, stdout=log_file, stderr=log_file)
+                if r.returncode:
+                    print_message("warning", f"{os.path.basename(cmd[0])} failed for "
+                                             f"{block_dir.name}, see {merge_log}")
+                    break
+        if merged.exists():
+            table = vlt_coverage_table(str(merged))
+            (block_dir / "coverage.txt").write_text("\n".join(table) + "\n")
+            tables[block_dir.name] = table
+    return tables
+
+
 def report_coverage(tables, regression_dir, summary_path):
     """Print each block's totals and append them to the summary."""
     if not tables:
@@ -725,7 +788,8 @@ def report_coverage(tables, regression_dir, summary_path):
     for block, table in tables.items():
         block_dir = regression_dir / block
         lines += [f"Block: {block}", *table,
-                  f"UCDB: {block_dir / 'merged.ucdb'}",
+                  (f"DAT:  {block_dir / 'merged.dat'}" if (block_dir / "merged.dat").exists()
+                   else f"UCDB: {block_dir / 'merged.ucdb'}"),
                   f"HTML: {block_dir / 'coverage_html' / 'index.html'}", ""]
     text = "\n".join(lines)
     print(text)
@@ -774,7 +838,7 @@ def main():
     parser.add_argument("--timeout", type=int, default=300, help="Per-test wall-clock timeout in seconds; a test exceeding it is killed. One that had reached $finish is judged from its output, one that had not is rerun (see --reruns) and then FAILED (default: 300)")
     parser.add_argument("--finish_grace", type=int, default=60, help="Seconds a simulator may keep running after $finish (coverage save, quit) before it is killed and the test judged from its output; 0 waits for --timeout instead (default: 60)")
     parser.add_argument("--reruns", type=int, default=1, help="How many times a test whose simulator stopped before $finish for a reason that is not the test's (killed at --timeout, or its license process failed) is rerun with the same seed before it counts as FAILED; 0 never reruns (default: 1)")
-    parser.add_argument("--simulator", type=str, choices=["modelsim", "vcs"], default="modelsim", help="Simulator to use for every test in the regression (default: modelsim)")
+    parser.add_argument("--simulator", type=str, choices=["modelsim", "vcs", "verilator"], default="modelsim", help="Simulator to use for every test in the regression (default: modelsim). With verilator, each design is built once (minutes) and every test runs the built program (see README 'Verilator')")
     parser.add_argument("--no-shared-lib", action="store_true", help="Compile and optimize inside every test, as before the shared design libraries (slower; use if a library build is in the way)")
     parser.add_argument("--launcher", choices=["local", "srun"], default="local", help="Where each design build and test runs: local runs it on this machine; srun runs it through Slurm, which picks a machine with a free slot and queues it until there is one. The work area must have the same path on every machine (see README 'Tests on other machines'). With srun, --max_parallel is how many tests the runner hands to Slurm at once, and --timeout counts from the moment a test starts on its machine (default: local)")
     parser.add_argument("--srun_args", type=str, default="", help="Extra srun options for every build and test with --launcher srun, as one string, e.g. \"--constraint=questa\" to keep Questa runs on the machines that have a Questa license. Never --job-name: the runner names each job itself (default: none)")
@@ -859,9 +923,11 @@ def main():
     # Build each DESIGN once (Idan, 2026-09-16). Questa optimizes the design
     # inside vsim, so every test of one design used to re-optimize it; a work
     # library with a named snapshot is built here instead, and the tests just
-    # run it. Measured on one design: 4.8 s per test becomes 1.8 s.
+    # run it. Measured on one design: 4.8 s per test becomes 1.8 s. Verilator
+    # builds one program per design (minutes), and every test runs it.
     libs, build_failed = {}, set()
-    if args.simulator == "modelsim" and not args.no_shared_lib:
+    lib_name = {"modelsim": "sv_tb_work", "verilator": "obj_dir"}.get(args.simulator)
+    if lib_name and not args.no_shared_lib:
         wanted = {}
         for block, test, _seed, _rundir, _attempt in test_queue:
             comp = comp_of_tests(block).get(test)
@@ -881,9 +947,11 @@ def main():
                                 total=len(jobs), desc="compiling",
                                 bar_format='{l_bar}{bar} | {elapsed}'):
                     (b, c), ok = job.result()
-                    if ok:
-                        libs[(b, c)] = regression_dir / "_build" / b / c / "sv_tb_work"
-                    else:
+                    # a failed Verilator build leaves no program, so its tests
+                    # stop at once instead of each building the design again
+                    if ok or args.simulator == "verilator":
+                        libs[(b, c)] = regression_dir / "_build" / b / c / lib_name
+                    if not ok:
                         build_failed.add((b, c))
                         tqdm.write(f"{c}: {RED}compilation failed{RESET} "
                                    f"({regression_dir / '_build' / b / c / 'build.log'})")
@@ -1020,7 +1088,7 @@ def main():
     pbar.close() 
     print()
     if args.codecov:
-        report_coverage(merge_coverage(regression_dir), regression_dir,
+        report_coverage(merge_coverage(regression_dir, args.simulator), regression_dir,
                         regression_dir / "summary.txt")
     
     effective_passed = passed_tests + (0 if args.pedant else passed_warn_tests)

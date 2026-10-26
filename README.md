@@ -10,7 +10,7 @@ the runner code lives here.
 
 | script | what it does | example |
 |---|---|---|
-| `test_runner.py` | compile + run one UVM test (Questa or VCS) | `python3 bin/runners/test_runner.py -b <block> -t <test> [--uvm_test <name>] [--sim_args +X]` |
+| `test_runner.py` | compile + run one UVM test (Questa, VCS or Verilator) | `python3 bin/runners/test_runner.py -b <block> -t <test> [--uvm_test <name>] [--sim_args +X]` |
 | `regr_runner.py` | run a list of tests in parallel, summarize, merge coverage | `python3 bin/runners/regr_runner.py --tests <regr.yaml> --name <run> [--timeout 300]` |
 | `synth_runner.py` | yosys synthesis for a block (templates in `synth/`) | `python3 bin/runners/synth_runner.py -b <block> [--top <mod>]` |
 | `metric_runner.py` | synthesize + report relative area/timing, diff two designs | `python3 bin/runners/metric_runner.py -b <block_a> --vs <block_b>` |
@@ -103,6 +103,78 @@ process (`vlm`, which runs `salt_mgls_asynch`), and `vlm` puts itself in a proce
 of its own. The process group kill used before missed it, and `vlm` printed
 `** Fatal: Read failure in vlm process (0,0)` as it noticed its `vsim` gone. That line
 in an older log marks a test the runner killed; it is not what made the test hang.
+
+### Verilator (`--simulator verilator`)
+
+`test_runner` and `regr_runner` run UVM 1.2 tests on Verilator. Verilator builds the
+design and the bench into one program. A build takes minutes, most of them for the UVM
+library. A test is one run of that program. `regr_runner` builds each design once and
+runs every test with that build, as it does with a Questa snapshot.
+
+```bash
+python3 bin/runners/test_runner.py -b <block> -t <test> --simulator verilator
+python3 bin/runners/regr_runner.py --tests <regr.yaml> --name <run> --simulator verilator
+```
+
+| setting | what it is | default |
+|---|---|---|
+| `PATH` (environment) | where `verilator` is found. A project puts another build first on PATH, for example in `bin/setenv.local.sh`. Do not set `VERILATOR_BIN`: Verilator's own wrapper reads it as the name of its `verilator_bin`. | on lab-lnx, put `/opt/verilator/current/bin` first (see below) |
+| `UVM_HOME` (environment) | the UVM 1.2 source tree: the directory that holds `src/` | `<vsim dir>/../verilog_src/uvm-1.2`, when Questa's `vsim` is on PATH |
+| `VERILATOR_SOLVER` (environment) | the SMT solver command that the built program runs for `randomize()` with constraints | `z3` on PATH. lab-lnx has no z3; ovip-dev uses `/opt/yosys/v0.67/bin/yices-smt2 --incremental`. |
+| `verilator_config` (config.yaml) | Verilator configuration files (`.vlt`), relative to the block, as `files` are | none |
+
+The build is
+`verilator --binary --timing --vpi -j <CPUs> -Wno-fatal -Wno-lint -Wno-style +incdir+$UVM_HOME/src <verilator_config files> $UVM_HOME/src/uvm_pkg.sv -f comp_filelist.f <uvm_dpi.cc> --top-module <top> --Mdir obj_dir`:
+
+- `comp_filelist.f` is the same file list that Questa gets. For something that only one
+  simulator should get, use the jinja variable `TOOL` in config.yaml. It is `vsim`,
+  `vcs` or `verilator`.
+- The UVM DPI code is a copy of `$UVM_HOME/src/dpi/` with the Verilator HDL backend of
+  [verilator/uvm12_dpi/](verilator/uvm12_dpi/README.md) over it. With it,
+  `uvm_hdl_force` and `uvm_hdl_read` work through VPI. A signal that a test forces needs
+  `forceable` and `public_flat_rw` in a `.vlt` file.
+- `-j` is the number of CPUs that the process may use: all of them on the local machine,
+  and only the job's CPUs under Slurm. A build through `--launcher srun` therefore gets
+  one CPU, unless `--srun_args` asks for more (`--cpus-per-task`, which then applies to
+  the tests too).
+- In `comp.log`, `%Error`, `make: ***` and compiler `error:` lines fail the build.
+  `%Warning` lines are warnings, except the warnings inside `$UVM_HOME`.
+
+The run is `obj_dir/V<top> +verilator+seed+<seed+1> +UVM_TESTNAME=<test> ... <sim_args>`.
+It runs line-buffered (`stdbuf -oL`), so `regr_runner` sees the `$finish` line while the
+program still runs. Its output goes to `run.log`.
+
+- Verilator wants a seed of 1 or more, so `--seed N` runs Verilator seed N+1. The first
+  line of `run.log` says so. It is not the random stream of Questa's `-sv_seed N`.
+- `run.log` follows the Questa rules (the UVM report summary, `UVM_ERROR`, `UVM_FATAL`),
+  and also `%Error` (fail) and `%Warning` (warning).
+- Waves (`--dump`, `--dump-mem`): the build adds tracing and a module, bound into the
+  top, that calls `$dumpvars(0, <--dut>)` when the run has `+vlsi_runners_waves`. The run
+  writes `waves.vcd` in the run directory. It writes `waves.fst` instead when `lz4.h` is
+  installed (package `liblz4-dev`), because Verilator's FST writer needs it. Buses are
+  dumped up to 65536 bits wide. `--dump` leaves out arrays of more than 32 entries, as
+  Questa's `--dump` leaves out memories; `--dump-mem` dumps them up to 65536 entries.
+- Code coverage (`--codecov`): the build adds `--coverage` (line, branch, expression,
+  toggle and FSM) and counts only the design's files, as on Questa: Verilator's
+  preprocessor lists every file of the build, and a generated `.vlt` file turns coverage
+  off in each one that is not a `design` block's (and always in UVM). Without a `design`
+  block, everything but UVM counts. The run writes `coverage.dat` and the totals table
+  `coverage.txt` in the run directory. `regr_runner` merges each block's databases with
+  `verilator_coverage` into `merged.dat`, writes `coverage.txt` (also appended to
+  `summary.txt`), and makes `coverage_html/index.html` with `genhtml` (package `lcov`).
+  Do not rely on the `fsm_state` and `fsm_arc` rows yet. Verilator's FSM coverage is new:
+  on one test, 5.052 and Verilator main of 2026-10-25 gave different figures, and neither
+  recorded the state machine's real transitions.
+- A build records what it can do in `obj_dir/vlsi_runners_build.json`. A run with
+  `--dump` or `--codecov` stops with an error when its build was made without it.
+- Verilator is 2-state. A test that checks X or Z cannot pass.
+- The Verilator for the runners on lab-lnx is `/opt/verilator/current`: Verilator main
+  of 2026-10-25 (`verilator --version`: rev v5.052-597-g8022612fe), built from
+  `/src/tools/verilator`, installed in `/opt/verilator/v5.052-597-g8022612fe`. The
+  release on PATH, `/usr/local/bin/verilator` (5.052), fails on parameterized classes
+  in ovip_axi. A project puts `/opt/verilator/current/bin` first on PATH in its
+  `bin/setenv.local.sh`. On it, ovip_apb_testbench passes 7/7 and ovip_axi_testbench
+  51/52 (ovip_axi_xz_test checks X).
 
 ### Tests on other machines (`regr_runner --launcher srun`, Slurm)
 

@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import os
+import re
 import shlex
+import shutil
+import signal
 import subprocess
 import sys
 from proj_utils import *
@@ -39,6 +43,20 @@ vcs_sim_warn    = UVM_SIM_WARN  + [r"^Warning-\["]
 vcs_sim_fail    = UVM_SIM_FAIL  + [r"^Error-\[", r"\$fatal"]
 vcs_sim_waive   = []
 
+# Verilator. The compile log holds Verilator's messages, then make's and
+# the C++ compiler's; the report line comes last, after a good build. The
+# warnings inside the UVM library itself are waived per build (its path is
+# only known then).
+vlt_comp_passed = [r"^- V e r i l a t i o n   R e p o r t:"]
+vlt_comp_warn   = [r"^%Warning"]
+vlt_comp_fail   = [r"^%Error", r"^make: \*\*\*", r": (fatal )?error: "]
+vlt_comp_waive  = []
+
+vlt_sim_passed  = UVM_SIM_PASSED
+vlt_sim_warn    = UVM_SIM_WARN  + [r"^%Warning"]
+vlt_sim_fail    = UVM_SIM_FAIL  + [r"^%Error"]
+vlt_sim_waive   = []
+
 wa_root = None
 
 
@@ -60,14 +78,16 @@ def _resolve_simdir(args):
 
 def _gather_attrs_and_filelist(args, simdir):
     """Run jinja substitution, parse attributes, write the filelist (shared
-    between simulators -- +define+/+incdir+ syntax is the same for both)."""
+    between simulators -- +define+/+incdir+ syntax is the same for all
+    three). Returns the simulation arguments, the design's files, and the
+    Verilator configuration files (config.yaml ``verilator_config``)."""
     jinja2_variables = {
-        "TOOL": "vsim" if args.simulator == "modelsim" else "vcs",
+        "TOOL": {"modelsim": "vsim", "vcs": "vcs", "verilator": "verilator"}[args.simulator],
         "WA_ROOT": wa_root,
         "TOP_BLOCK": args.block,
         **os.environ,
     }
-    attributes_to_parse = ["include_dirs", "defines", "files", "comp_args", "sim_args"]
+    attributes_to_parse = ["include_dirs", "defines", "files", "comp_args", "sim_args", "verilator_config"]
     attributes, blocks = parse_attributes(args.block, "verif", attributes_to_parse,
                                           jinja2_variables, with_blocks=True)
     # the RTL under test: every file of every `design` block in the tree.
@@ -92,7 +112,7 @@ def _gather_attrs_and_filelist(args, simdir):
     if args.sim_args:
         sim_args.extend([w for sub in args.sim_args for item in sub for w in item.split()])
     sim_args.extend(attributes["sim_args"])
-    return " ".join(sim_args), design_files
+    return " ".join(sim_args), design_files, attributes["verilator_config"]
 
 
 # ----------------------------------------------------------------------
@@ -309,38 +329,47 @@ def run_modelsim(args, simdir, sim_args, design_files=frozenset()):
             print(f"DUMP: {simdir}/waves.wlf")
         if args.codecov:
             _print_coverage(simdir)
-        if expect:
-            # an EXPECTED failure (open item 50): this test exists to make a
-            # guard fire, so the run failing is the pass condition. Both
-            # halves are required, or a guard that stopped firing would read
-            # as green: the run must have failed, and the log must carry the
-            # guard's own words.
-            try:
-                log_text = open(f"{simdir}/run.log", errors="ignore").read()
-            except OSError:
-                print_message('error',
-                              "the simulation left no log, so there is nothing "
-                              "to check the expected failure against")
-                exit(1)
-            fired = expect in log_text
-            failed = bool(r) or status in ("FAILED", "UNKNOWN")
-            if fired and failed:
-                print_message('info', f"expected failure seen: {expect}")
-                exit(0)
-            if not fired:
-                print_message('error',
-                              f"the guard did not fire: nothing in the log "
-                              f"matched {expect!r}")
-            else:
-                print_message('error',
-                              "the guard's text is in the log but the run "
-                              "passed; the runner no longer treats it as a "
-                              "failure")
+        _exit_on_verdict(args, simdir, r, status)
+
+
+def _exit_on_verdict(args, simdir, r, status):
+    """Exit with test_runner's code for a finished simulation: its exit
+    code ``r`` and the status of its run.log. 0 passed, 2 passed with
+    warnings (1 under --pedant), 1 failed; a test that declares
+    ``expect_fail`` inverts it. Returns only for a plain pass."""
+    expect = getattr(args, "expect_fail", None)
+    if expect:
+        # an EXPECTED failure (open item 50): this test exists to make a
+        # guard fire, so the run failing is the pass condition. Both
+        # halves are required, or a guard that stopped firing would read
+        # as green: the run must have failed, and the log must carry the
+        # guard's own words.
+        try:
+            log_text = open(f"{simdir}/run.log", errors="ignore").read()
+        except OSError:
+            print_message('error',
+                          "the simulation left no log, so there is nothing "
+                          "to check the expected failure against")
             exit(1)
-        if r or status in ("FAILED", "UNKNOWN"):
-            exit(1)
-        if status == "PASSED_WARN":
-            exit(1 if args.pedant else 2)
+        fired = expect in log_text
+        failed = bool(r) or status in ("FAILED", "UNKNOWN")
+        if fired and failed:
+            print_message('info', f"expected failure seen: {expect}")
+            exit(0)
+        if not fired:
+            print_message('error',
+                          f"the guard did not fire: nothing in the log "
+                          f"matched {expect!r}")
+        else:
+            print_message('error',
+                          "the guard's text is in the log but the run "
+                          "passed; the runner no longer treats it as a "
+                          "failure")
+        exit(1)
+    if r or status in ("FAILED", "UNKNOWN"):
+        exit(1)
+    if status == "PASSED_WARN":
+        exit(1 if args.pedant else 2)
 
 
 # ----------------------------------------------------------------------
@@ -429,6 +458,360 @@ def run_vcs(args, simdir, sim_args):
             exit(1 if args.pedant else 2)
 
 
+# ----------------------------------------------------------------------
+# Verilator path
+#
+# Verilator compiles the design and the bench into one C++ program, so a
+# build takes minutes (most of it the UVM library) and a test is one run
+# of that program: one build per design, then one process per test, as
+# with a Questa snapshot. Verilator ships no UVM. The UVM 1.2 source comes
+# from $UVM_HOME, and its DPI code from $UVM_HOME/src/dpi with the
+# Verilator HDL backend of verilator/uvm12_dpi/ over it (uvm_hdl_force and
+# the rest, through VPI). Verilator is 2-state: a test that checks X or Z
+# cannot pass.
+# ----------------------------------------------------------------------
+_RUNNER_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _uvm_home():
+    """The UVM 1.2 tree (the directory that holds src/): $UVM_HOME, or
+    else the one inside the Questa install when vsim is on PATH, or None."""
+    home = os.environ.get("UVM_HOME")
+    if home:
+        return os.path.normpath(home)
+    vsim = shutil.which("vsim")
+    if vsim:
+        guess = os.path.normpath(os.path.join(os.path.dirname(vsim), "..", "verilog_src", "uvm-1.2"))
+        if os.path.isfile(os.path.join(guess, "src", "uvm_pkg.sv")):
+            return guess
+    return None
+
+
+def _uvm_dpi_source(mdir, uvm_home):
+    """$UVM_HOME/src/dpi copied into the build directory, with the Verilator
+    HDL backend put over the copy when that UVM has none. Returns the
+    copy's uvm_dpi.cc, the one file to compile (it includes the others)."""
+    dst = os.path.join(mdir, "uvm_dpi")
+    shutil.rmtree(dst, ignore_errors=True)
+    # copyfile, not copy2: an install's read-only modes would block the overlay
+    shutil.copytree(os.path.join(uvm_home, "src", "dpi"), dst, copy_function=shutil.copyfile)
+    with open(os.path.join(dst, "uvm_hdl.c"), errors="ignore") as f:
+        has_backend = "verilator" in f.read().lower()
+    if not has_backend:
+        for name in ("uvm_hdl.c", "uvm_hdl_verilator.c"):
+            shutil.copyfile(os.path.join(_RUNNER_DIR, "verilator", "uvm12_dpi", name),
+                            os.path.join(dst, name))
+    return os.path.join(dst, "uvm_dpi.cc")
+
+
+def _run_logged(cmd, cwd, log_path, header=()):
+    """Run ``cmd`` (a list) in ``cwd``, its stdout and stderr both to the
+    console and to ``log_path``, which starts with the ``header`` lines.
+    Verilator writes no log file of its own. Returns the exit code."""
+    with open(log_path, "w") as log:
+        for line in header:
+            log.write(line + "\n")
+            print(line)
+        log.flush()
+        try:
+            proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL, text=True, errors="replace")
+        except OSError as e:
+            print_message("error", f"{cmd[0]}: {e}")
+            return 1
+        try:
+            for line in proc.stdout:
+                log.write(line)
+                sys.stdout.write(line)
+                sys.stdout.flush()
+            return proc.wait()
+        except KeyboardInterrupt:
+            proc.send_signal(signal.SIGINT)
+            return proc.wait()
+
+
+# What a build can do, written beside it: waves (their format and the
+# scope they cover) and code coverage. A run asks for what its build has.
+_BUILD_RECORD = "vlsi_runners_build.json"
+
+
+def _read_build_record(mdir):
+    try:
+        with open(os.path.join(mdir, _BUILD_RECORD)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _waves_source(mdir, top, scope, fmt):
+    """A module bound into the top that starts the wave dump of ``scope``
+    when the run has +vlsi_runners_waves. Verilator dumps only what
+    $dumpvars asks for, and a bench need not call it. Returns its path."""
+    path = os.path.join(mdir, "vlsi_runners_waves.sv")
+    with open(path, "w") as f:
+        f.write("// Written by test_runner --dump: the run's +vlsi_runners_waves starts the dump.\n"
+                "module vlsi_runners_waves;\n"
+                "  initial if ($test$plusargs(\"vlsi_runners_waves\")) begin\n"
+                f"    $dumpfile(\"waves.{fmt}\");\n"
+                f"    $dumpvars(0, {scope});\n"
+                "  end\n"
+                "endmodule\n"
+                f"bind {top} vlsi_runners_waves u_vlsi_runners_waves ();\n")
+    return path
+
+
+def _source_files(vbin, pre_args, simdir):
+    """Every source file Verilator reads for a build, `include`d ones and
+    those of nested -f lists too, from the `line directives of its
+    preprocessor output (-E, 3 s on an OVIP bench). Returns {name as
+    Verilator knows it: real path}, or None when the preprocessor failed."""
+    proc = subprocess.Popen([vbin, "-E", *pre_args], cwd=simdir, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                            text=True, errors="replace")
+    files = {}
+    for line in proc.stdout:
+        if line.startswith("`line "):
+            m = re.match(r'`line \d+ "([^"]*)"', line)
+            if m and m.group(1) not in files:
+                files[m.group(1)] = os.path.realpath(os.path.join(simdir, m.group(1)))
+    return files if proc.wait() == 0 else None
+
+
+def _verilator_include(vbin):
+    """Verilator's own include directory, which holds verilated_std.sv (its
+    std package, compiled into every build without being named)."""
+    try:
+        root = subprocess.run([vbin, "--getenv", "VERILATOR_ROOT"], capture_output=True,
+                              text=True, timeout=60).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return os.path.join(root, "include") if root else None
+
+
+def _not_covered(real, design_files, skip_dirs):
+    """True for a file whose coverage does not count: one under
+    ``skip_dirs`` (UVM, Verilator's own) always, and with a design block in
+    the tree, everything that is not the design's (as with Questa: the
+    bench, the VIPs and UVM are not what coverage closure is about). A VIP's
+    own bench, without a design block, covers the rest."""
+    if any(d and real.startswith(os.path.realpath(d) + os.sep) for d in skip_dirs):
+        return True
+    return bool(design_files) and real not in design_files
+
+
+def _coverage_vlt(mdir, files, design_files, skip_dirs):
+    """A Verilator configuration file that turns coverage off in every file
+    that does not count, which also keeps the run fast. Each file is named:
+    a coverage_on after `coverage_off -file "*"` turns nothing back on
+    (checked on 5.052 and 5.053). Returns its path."""
+    path = os.path.join(mdir, "vlsi_runners_coverage.vlt")
+    with open(path, "w") as f:
+        f.write("`verilator_config\n"
+                "// Written by test_runner --codecov: coverage counts only in the design's files.\n")
+        for d in skip_dirs[1:]:
+            if d:
+                f.write(f'coverage_off -file "{d}/*"\n')
+        for name, real in sorted(files.items()):
+            if _not_covered(real, design_files, skip_dirs):
+                f.write(f'coverage_off -file "{name}"\n')
+    return path
+
+
+def _coverage_keys(line):
+    """The keys of one point of a Verilator coverage.dat, ``C '<keys>' <count>``:
+    \\x01 starts each key, \\x02 ends its name. "f" is the file, "t" the type."""
+    return dict(x.partition("\x02")[::2] for x in line[3:line.rindex("' ")].split("\x01") if x)
+
+
+def _coverage_records(dat):
+    """(keys, count) of each point in a Verilator coverage.dat."""
+    with open(dat, errors="replace") as f:
+        for line in f:
+            if line.startswith("C '"):
+                yield _coverage_keys(line), int(line.rstrip("\n").rpartition("' ")[2])
+
+
+def _keep_counted_coverage(dat, simdir, design_files, skip_dirs):
+    """Drop from coverage.dat the points of files that do not count: FSM
+    coverage ignores coverage_off (checked on 5.052 and 5.053)."""
+    with open(dat, errors="replace") as f:
+        lines = f.readlines()
+    with open(dat, "w") as f:
+        for line in lines:
+            if line.startswith("C '"):
+                real = os.path.realpath(os.path.join(simdir, _coverage_keys(line).get("f", "")))
+                if _not_covered(real, design_files, skip_dirs):
+                    continue
+            f.write(line)
+
+
+# Verilator's coverage types, in the order of a summary table
+_VLT_COVER_TYPES = ["line", "branch", "expr", "toggle", "fsm_state", "fsm_arc"]
+
+
+def coverage_table(dat):
+    """The summary table of a Verilator coverage.dat: covered points and
+    points per coverage type, and in total."""
+    counts = {}
+    for keys, count in _coverage_records(dat):
+        t = keys.get("t", "?")
+        covered, points = counts.get(t, (0, 0))
+        counts[t] = (covered + (count > 0), points + 1)
+    rank = lambda t: (_VLT_COVER_TYPES.index(t) if t in _VLT_COVER_TYPES else len(_VLT_COVER_TYPES), t)
+    rows = [f"{'Coverage type':<14} {'Covered':>9} {'Points':>9} {'Percent':>8}"]
+    for t in sorted(counts, key=rank):
+        covered, points = counts[t]
+        rows.append(f"{t:<14} {covered:>9} {points:>9} {100.0 * covered / points:>7.1f}%")
+    covered = sum(c for c, _ in counts.values())
+    points = sum(n for _, n in counts.values())
+    rows.append(f"{'total':<14} {covered:>9} {points:>9} "
+                f"{(100.0 * covered / points if points else 0.0):>7.1f}%")
+    return rows
+
+
+def run_verilator(args, simdir, sim_args, vlt_files=(), design_files=frozenset()):
+    # from PATH: Verilator's own wrapper reads $VERILATOR_BIN (the name of
+    # its verilator_bin), so a runner variable of that name made it call
+    # itself; a project picks another build by putting it first on PATH
+    vbin = shutil.which("verilator")
+    lib = args.lib or "obj_dir"
+    mdir = lib if os.path.isabs(lib) else os.path.join(simdir, lib)
+    binary = os.path.join(mdir, f"V{args.top}")
+    waves = args.dump or args.dump_mem
+    uvm_home = _uvm_home()
+
+    do_comp = not args.run_only
+    do_sim = not args.compile_only
+
+    if do_comp:
+        if not vbin:
+            print_message("error", "verilator is not on PATH")
+            exit(1)
+        # the wrapper runs $VERILATOR_BIN; naming a wrapper there loops, and
+        # make goes on calling it, so the build never ends
+        if os.path.basename(os.environ.get("VERILATOR_BIN", "")) == "verilator":
+            print_message("error", f"VERILATOR_BIN={os.environ['VERILATOR_BIN']} names a verilator "
+                                   f"wrapper, which then runs itself; unset it (the runner takes "
+                                   f"verilator from PATH)")
+            exit(1)
+        if not uvm_home:
+            print_message("error", "no UVM 1.2 source: set UVM_HOME (the uvm-1.2 directory "
+                                   "that holds src/), or put Questa's vsim on PATH")
+            exit(1)
+        print_message("info", f"Verilator: {vbin}; UVM: {uvm_home}")
+        os.makedirs(mdir, exist_ok=True)
+        # a failed build must not leave the last good one to run
+        for stale in (binary, os.path.join(mdir, _BUILD_RECORD)):
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
+        dpi = _uvm_dpi_source(mdir, uvm_home)
+        sources = [f"+incdir+{uvm_home}/src", f"{uvm_home}/src/uvm_pkg.sv", "-f", "comp_filelist.f"]
+        opts, record = [], {"verilator": vbin, "waves": None, "coverage": False}
+        if waves:
+            # FST is smaller, but Verilator's FST writer needs lz4.h (liblz4-dev)
+            fmt = "fst" if os.path.exists("/usr/include/lz4.h") else "vcd"
+            # wide buses whole (the default stops at 256 bits), structs by field
+            opts += [f"--trace-{fmt}", "--trace-structs", "--trace-max-width", "65536"]
+            if args.dump_mem:
+                opts += ["--trace-max-array", "65536"]  # the default stops at 32 entries
+            sources.append(_waves_source(mdir, args.top, args.dut, fmt))
+            record.update(waves=fmt, waves_scope=args.dut)
+        if args.codecov:
+            files = _source_files(vbin, [*sources, "--top-module", args.top], simdir)
+            if files is None:
+                print_message("error", "Verilator's preprocessor failed, so the files to cover "
+                                       "are unknown (see the build below without --codecov)")
+                exit(1)
+            opts += ["--coverage"]
+            skip_dirs = [uvm_home, _verilator_include(vbin)]
+            vlt_files = [_coverage_vlt(mdir, files, design_files, skip_dirs), *vlt_files]
+            record["coverage"] = True
+        # the CPUs this process may use: all of them here, the job's under Slurm
+        jobs = len(os.sched_getaffinity(0))
+        comp_cmd = [vbin, "--binary", "--timing", "--vpi", "-j", str(jobs),
+                    "-Wno-fatal", "-Wno-lint", "-Wno-style", *opts, *vlt_files, *sources, dpi,
+                    "--top-module", args.top, "--Mdir", mdir]
+        r = _run_logged(comp_cmd, simdir, f"{simdir}/comp.log")
+        waive = vlt_comp_waive + [rf"^%Warning-\S+: {re.escape(uvm_home)}/"]
+        status = parse_log(f"{simdir}/comp.log", vlt_comp_passed, vlt_comp_warn, vlt_comp_fail, waive, False, True)
+        if (r or status in ("FAILED", "UNKNOWN") or (status == "PASSED_WARN" and args.pedant)
+                or not os.access(binary, os.X_OK)):
+            print_message('error', "Compilation Failed")
+            print_message('error', f"LOG:  {simdir}/comp.log")
+            exit(1)
+        with open(os.path.join(mdir, _BUILD_RECORD), "w") as f:
+            json.dump(record, f, indent=1)
+
+    if do_sim:
+        if not os.access(binary, os.X_OK):
+            print_message('error', f"no Verilator build at {binary}: its build failed or "
+                                   f"never ran (see comp.log beside it)")
+            exit(1)
+        record = _read_build_record(mdir)
+        if waves and not record.get("waves"):
+            print_message('error', f"the build at {mdir} has no waves: build it with --dump")
+            exit(1)
+        if args.codecov and not record.get("coverage"):
+            print_message('error', f"the build at {mdir} has no coverage: build it with --codecov")
+            exit(1)
+        if waves and record.get("waves_scope") != args.dut:
+            print_message('warning', f"the build dumps {record.get('waves_scope')}, not {args.dut}")
+        if not os.environ.get("VERILATOR_SOLVER") and not shutil.which("z3"):
+            print_message("warning", "VERILATOR_SOLVER is not set and z3 is not on PATH, so "
+                                     "randomize() with constraints fails")
+        # Verilator wants a seed of 1 or more, so test_runner's seed N is
+        # Verilator's N+1; it is a different random stream from Questa's
+        # -sv_seed N in any case
+        vseed = args.seed + 1
+        run_cmd = [binary, f"+verilator+seed+{vseed}"]
+        if waves:
+            run_cmd.append("+vlsi_runners_waves")
+        if args.codecov:
+            run_cmd.append(f"+verilator+coverage+file+{simdir}/coverage.dat")
+        if args.uvm_test:
+            run_cmd += [f"+UVM_TESTNAME={args.uvm_test}", f"+UVM_MAX_QUIT_COUNT={args.uvm_max_quit}",
+                        f"+UVM_VERBOSITY={args.verbosity}"]
+        run_cmd += shlex.split(sim_args)
+        # a program's stdout to a pipe is block-buffered, which would hold the
+        # whole log until exit; line-buffered, regr_runner sees $finish live
+        if shutil.which("stdbuf"):
+            run_cmd = ["stdbuf", "-oL", "-eL"] + run_cmd
+        expect = getattr(args, "expect_fail", None)
+        # as in run_modelsim: an old log or coverage database must not
+        # answer for this run
+        stale = (["run.log"] if expect else []) + (["coverage.dat", "coverage.txt"] if args.codecov else [])
+        for name in stale:
+            try:
+                os.remove(f"{simdir}/{name}")
+            except OSError:
+                pass
+        header = [f"[test_runner] Verilator seed {vseed} (+verilator+seed+{vseed}) for "
+                  f"--seed {args.seed}; not the random stream of Questa's -sv_seed {args.seed}"]
+        r = _run_logged(run_cmd, simdir, f"{simdir}/run.log", header)
+        if r and not expect:
+            print_message('error', f"Simulation Failed {r}")
+            exit(1)
+        status = parse_log(f"{simdir}/run.log", vlt_sim_passed, vlt_sim_warn, vlt_sim_fail, vlt_sim_waive, True, True)
+        print("---")
+        print(f"LOG:  {simdir}/run.log")
+        if waves:
+            print(f"DUMP: {simdir}/waves.{record['waves']}")
+        if args.codecov:
+            dat = f"{simdir}/coverage.dat"
+            if os.path.exists(dat):
+                skip_dirs = [uvm_home, _verilator_include(record.get("verilator") or vbin or "verilator")]
+                _keep_counted_coverage(dat, simdir, design_files, skip_dirs)
+                table = coverage_table(dat)
+                with open(f"{simdir}/coverage.txt", "w") as f:
+                    f.write("\n".join(table) + "\n")
+                print("\n".join(table))
+                print(f"COV:  {dat}")
+            else:
+                print_message("warning", "the simulation saved no coverage database")
+        _exit_on_verdict(args, simdir, r, status)
+
 
 def source_project_env():
     """Source <git_root>/bin/setenv.sh and merge its exports into os.environ so the sim
@@ -457,10 +840,12 @@ def generate_sim_command(args):
         shutil.rmtree(simdir, ignore_errors=True)
     os.makedirs(simdir, exist_ok=True)
 
-    sim_args, design_files = _gather_attrs_and_filelist(args, simdir)
+    sim_args, design_files, vlt_files = _gather_attrs_and_filelist(args, simdir)
 
     if args.simulator == "vcs":
         run_vcs(args, simdir, sim_args)
+    elif args.simulator == "verilator":
+        run_verilator(args, simdir, sim_args, vlt_files, design_files)
     else:
         run_modelsim(args, simdir, sim_args, design_files)
 
@@ -539,12 +924,14 @@ def main():
         exit(1)
 
     VERBOSITY_LEVELS = ['UVM_HIGH', 'UVM_MEDIUM', 'UVM_LOW', 'UVM_NONE']
-    parser = argparse.ArgumentParser(description="UVM Test Runner Wrapper (Modelsim/Questa or VCS)")
+    parser = argparse.ArgumentParser(description="UVM Test Runner Wrapper (Modelsim/Questa, VCS or Verilator)")
 
     parser.add_argument("-b",'--block', type=str, help="name of design or verif block", required=True)
     parser.add_argument('-t', '--test', type=str, help="test name (as defined in tests,.yaml)", required=True)
-    parser.add_argument('--simulator', type=str, choices=['modelsim', 'vcs'], default='modelsim',
-                        help="Which simulator to use (default: modelsim). The VCS path is best-effort and may need tuning for your install.")
+    parser.add_argument('--simulator', type=str, choices=['modelsim', 'vcs', 'verilator'], default='modelsim',
+                        help="Which simulator to use (default: modelsim). The VCS path is best-effort and may need tuning for your install. "
+                             "verilator takes the executable from PATH and the UVM 1.2 source "
+                             "from $UVM_HOME (default: the one in the Questa install); see README 'Verilator'.")
     parser.add_argument('--top', type=str, default='tb', help="Set top module name (default: tb)")
     parser.add_argument('--dut', type=str, help="Set top module name (default: tb)")
     parser.add_argument("--clean", action="store_true", help="clean run directory")
@@ -562,7 +949,9 @@ def main():
     parser.add_argument("--lib", type=str, help="Work library to compile into or run "
                         "against (default: sv_tb_work in the run directory). With "
                         "--compile-only it is built once; every --run-only test then "
-                        "points at it and skips both compilation and optimization.")
+                        "points at it and skips both compilation and optimization. "
+                        "With --simulator verilator it is the build directory (default: "
+                        "obj_dir in the run directory), which holds the program V<top>.")
     parser.add_argument("--gui", action="store_true", help="Run ModelSim in GUI mode")
     parser.add_argument("--dump", action="store_true", help="Collect dump file")
     parser.add_argument("--dump-mem", action="store_true", help="Collect dump file including memories")

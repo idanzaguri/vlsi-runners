@@ -111,6 +111,11 @@ def load_yaml(file_path, jinja2_variables=None, visited=None):
         content["include_dirs"] = [make_path_abs(inc, block_dir) for inc in content["include_dirs"]]
     if "files" in content and content["files"] is not None:
         content["files"] = [make_path_abs(f, block_dir) for f in content["files"]]
+    # Verilator configuration files (.vlt), read only by --simulator verilator
+    if "verilator_config" in content and content["verilator_config"] is not None:
+        vlt = content["verilator_config"]
+        content["verilator_config"] = [make_path_abs(f, block_dir)
+                                       for f in ([vlt] if isinstance(vlt, str) else vlt)]
 
 
     # Process includes recursively

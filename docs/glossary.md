@@ -68,6 +68,71 @@ runner reports them so two forms of one design can be compared.
 - **WCHAN**: the kernel function a sleeping process waits in, from
   `/proc/<pid>/wchan`. A killed test's log lists it for each process.
 
+## Verilator
+
+- **Verilator**: an open-source SystemVerilog simulator. It translates the
+  design and the bench into C++ and builds one program. It needs no license.
+  `test_runner --simulator verilator` runs it.
+- **VERILATOR_BIN**: a variable that Verilator's own `verilator` wrapper
+  reads: the name of the `verilator_bin` program it runs. The runner takes
+  `verilator` from PATH and does not use this variable. Set to a `verilator`
+  wrapper, it makes the wrapper call itself ("re-entered ... via
+  $VERILATOR_RUNNING").
+- **UVM_HOME**: the environment variable that names the UVM 1.2 source tree
+  (the directory that holds `src/`). Verilator ships no UVM, so the runner
+  compiles this one. Default: the tree inside the Questa install.
+- **VERILATOR_SOLVER**: the environment variable that names the SMT solver
+  the built program runs to solve `randomize()` constraints, for example
+  `z3 --in` or `yices-smt2 --incremental`.
+- **SMT solver**: a program that finds values for which a set of
+  constraints holds. Verilator hands `randomize()` constraints to one.
+- **TOOL**: the jinja variable in config.yaml that names the simulator of
+  the run: `vsim`, `vcs` or `verilator`.
+- **verilator_config, .vlt**: the config.yaml key for Verilator
+  configuration files. A `.vlt` file starts with `` `verilator_config `` and
+  holds Verilator commands, such as `forceable` and `public_flat_rw`.
+- **forceable, public_flat_rw**: `.vlt` commands. `forceable` lets a signal be
+  forced; `public_flat_rw` makes it reachable by name through VPI. A signal
+  that a test forces with `uvm_hdl_force` needs both.
+- **VPI**: the standard C interface through which C code reads and writes
+  simulator signals by name. `--vpi` turns it on in a Verilator build.
+- **UVM HDL backend**: the C code behind `uvm_hdl_force`, `uvm_hdl_deposit`
+  and `uvm_hdl_read`, one per simulator. UVM 1.2 has none for Verilator; the
+  runner's is in `verilator/uvm12_dpi/`.
+- **obj_dir, V<top>**: the Verilator build directory and the program in it,
+  named after the top module (`Vtb`). With `--lib`, the build directory is
+  elsewhere.
+- **+verilator+seed+N**: the run option that seeds a Verilator program. N
+  must be 1 or more, so the runner passes `--seed` + 1.
+- **2-state**: values are only 0 and 1. Verilator has no X or Z, so a test
+  that checks them cannot pass.
+- **Line-buffered**: a program writes its output at the end of each line, not
+  in large blocks. The runner runs the Verilator program through
+  `stdbuf -oL` for this.
+- **VCD, FST**: two wave file formats. VCD is plain text and large; FST is
+  compressed. Verilator writes FST only when `lz4.h` (package `liblz4-dev`)
+  is installed, so the runner writes `waves.vcd` without it.
+- **$dumpfile, $dumpvars**: the SystemVerilog calls that name the wave file
+  and choose what goes into it. A Verilator build dumps nothing unless the
+  design calls them.
+- **+vlsi_runners_waves**: the run option that starts the wave dump of a
+  Verilator build made with `--dump`. test_runner adds it to a `--dump` run.
+- **coverage.dat, merged.dat**: Verilator's coverage database of one run, and
+  the merge of a block's runs in a regression.
+- **verilator_coverage**: Verilator's tool that merges coverage databases
+  (`--write`) and writes them as an lcov file (`--write-info`).
+- **coverage_off**: a `.vlt` command that turns coverage off in a file. The
+  runner writes one per file that is not the design's. FSM coverage ignores
+  it, so the runner also drops those points from `coverage.dat`.
+- **Line, branch, expr, toggle, fsm_state, fsm_arc**: Verilator's coverage
+  types, the rows of its `coverage.txt`. Line is a block of statements, expr
+  a condition's terms, toggle a bit going 0 to 1 and 1 to 0, fsm_state and
+  fsm_arc the states and transitions of a state machine.
+- **lcov, genhtml**: the lcov file (`coverage.info`) is a common text format
+  for coverage; `genhtml` turns it into the HTML report `coverage_html/`.
+- **vlsi_runners_build.json**: the record beside a Verilator build of what it
+  can do: its verilator, its wave format and scope, and coverage.
+
 ## Tests on other machines (Slurm)
 
 - **Slurm**: a job scheduler. It keeps one queue for several machines and runs

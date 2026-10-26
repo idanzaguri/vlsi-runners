@@ -161,6 +161,8 @@ Do this for each new machine (the second PC, the laptop).
    sudo mkdir -p /opt/altera_lite/25.1std && sudo chown idan /opt/altera_lite/25.1std
    rsync -a lab-lnx:/opt/altera_lite/25.1std/questa_fse /opt/altera_lite/25.1std/
    ```
+   For `--simulator verilator`, copy `/opt/verilator` the same way (`rsync -a
+   lab-lnx:/opt/verilator /opt/`; the `current` link comes with it).
    `test_runner` also needs `python3-yaml` and `python3-jinja2`
    (`sudo apt install python3-yaml python3-jinja2`). Copy the `PATH` and
    `SALT_LICENSE_SERVER` lines of `~/.bashrc`. srun passes the environment of the shell
