@@ -18,7 +18,8 @@ the runner code lives here.
 
 `test_runner` selects the test from `verif/<block>/lib/tests.yaml`; a CLI `--uvm_test`
 overrides the one baked into the entry (handy for many flavors of one test class).
-`regr_runner --tests` takes a YAML list of `{name, block}` entries.
+`regr_runner --tests` takes a regression file: one list of entries, or several named
+regressions (see 'Regression files' below).
 
 ### One compile per design, not per test (Questa)
 
@@ -417,6 +418,10 @@ The toolchain is the ORFS checkout at `/src/tools/OpenROAD-flow-scripts` (or
 git submodule add git@github.com:idanzaguri/vlsi-runners.git bin/runners
 # fresh clones: git clone --recurse-submodules ...  (or: git submodule update --init)
 ```
+
+The runners need Python 3 with the packages PyYAML and Jinja2 (every runner, through
+`proj_utils.py`) and tqdm (`regr_runner.py`). A cocotb bench also needs cocotb in the
+project's Python (see 'cocotb benches' above).
 
 ## Glossary
 

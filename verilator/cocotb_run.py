@@ -32,9 +32,10 @@ def main(argv):
     jobs = kwargs.pop("jobs", None)
     import cocotb_tools.runner
     from cocotb_tools.runner import get_runner
-    # the runner's make -j is cpu_count(), which ignores the CPUs a Slurm job
-    # has, and it takes no argument for it; set it where the runner reads it
-    # (a private function of cocotb 2.1: without it, cocotb's own count stays)
+    # the runner's make -j is min(4, cpu_count()): cpu_count() counts the
+    # machine's CPUs, not the ones a Slurm job has, and the runner takes no
+    # argument for it; set it where the runner reads it (a private function
+    # of cocotb 2.1: without it, cocotb's own count stays)
     if jobs and hasattr(cocotb_tools.runner, "_get_max_parallel_build_jobs"):
         cocotb_tools.runner._get_max_parallel_build_jobs = lambda: jobs
     runner = get_runner("verilator")

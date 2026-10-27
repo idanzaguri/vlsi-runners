@@ -422,3 +422,12 @@ runner reports them so two forms of one design can be compared.
   stem, or `--name` (`--vs-name` for the second design). A folder that holds
   a measured run of another design or setup is refused, not overwritten;
   the same setup again is an incremental rerun.
+
+## Python packages
+
+- **PyYAML**: the Python package that reads YAML files (`import yaml`).
+  Every runner needs it.
+- **Jinja2**: the Python template package. The runners render config.yaml,
+  tests.yaml and regression files with it before PyYAML reads them. Every
+  runner needs it.
+- **tqdm**: the Python package that draws regr_runner's progress bars.
