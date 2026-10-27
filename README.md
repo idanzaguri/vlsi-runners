@@ -227,7 +227,15 @@ tests:
 
 ### Regression files (`regr_runner --tests`)
 
-A regression file is a list of tests, or several named regressions:
+A regression file is one list of entries (`tests:`), all of which run:
+
+```yaml
+tests:
+  - { block: apb_cdc, tests: [smoke, traffic, "reset*"] }   # a set: several tests of one block
+  - { block: axi_x, test: smoke, weight: 5 }                # one test
+```
+
+or several named regressions (`regressions:`), one of which runs:
 
 ```yaml
 held:                       # blocks kept out of every `blocks: all` (block: why)
@@ -244,17 +252,22 @@ regressions:
   nightly:
     - { include: check }
     - { include: errors }
-    - { block: apb_cdc, test: smoke, weight: 5 }   # the one-test form of a `tests:` list
+    - { block: apb_cdc, test: smoke, weight: 5 }   # one test
 ```
 
 - `--regression <name>` picks one; the run folder is `sim/regression/<name>/` unless
   `--name` says otherwise. `--list` prints the runs and exits.
-- An entry is one test, or a set: `blocks` (`all`, or a list), `tests` (names or globs),
-  `seeds` (a seed, a list, or a range `"a-b"`; without it, random seeds as `--repeat`
-  says), `sim_args` (plusargs on top of the test's own). `blocks: all` skips a block that
-  lacks a test; a block named in the entry must have it. A block, test and seed that
-  comes twice runs once; with two different `sim_args` it is an error, since both would
-  share one run folder.
+- An entry is one test or a set. One test has `block` and `test`. A set has `blocks`
+  (`all`, or a list) or `block` (one), and `tests` (names or globs). One test may add
+  `seed`; a set may add `seeds` (a seed, a list, or a range `"a-b"`). Both may add
+  `weight` and `sim_args` (plusargs on top of the test's own). A `tests:` list takes the
+  same entries as a named regression, except `include`. A key that the entry does not
+  take is an error.
+- Without a seed, a test runs once with a random seed; with `weight`, `weight` times
+  `--repeat` times, each with its own random seed.
+- `blocks: all` skips a block that lacks a test; a block named in the entry must have it.
+  A block, test and seed that comes twice runs once; with two different `sim_args` it is
+  an error, since both would share one run folder.
 - A hook runs in the work area's root after `bin/setenv.sh`, with `{block}`,
   `{block_dir}`, `{regression_dir}`, `{wa_root}` and `{passed}` (a file listing the
   passing runs' folders) replaced. `per: block` runs once for each block with a passing

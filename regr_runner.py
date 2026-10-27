@@ -636,15 +636,76 @@ def blocks_with_tests():
     return sorted(p.parent.parent.name for p in (Path(wa_root) / "verif").glob("*/lib/tests.yaml"))
 
 
-def expand_regression(regressions, name, held, seen=()):
-    """The one-test entries of a named regression, its includes expanded.
+# the keys of a one-test entry and of a set (README 'Regression files')
+_ONE_TEST_KEYS = {"block", "test", "seed", "weight", "sim_args"}
+_SET_KEYS = {"block", "blocks", "tests", "seeds", "weight", "sim_args"}
 
-    An entry is one test ({block, test, seed or weight}), or a set:
-    {blocks: all or a list, tests: names or globs, seeds: a seed, a list or
-    "a-b", sim_args: plusargs}, or {include: <regression>}. `blocks: all` is
+
+def expand_entry(e, held, where):
+    """The one-test entries of one entry of a regression file.
+
+    An entry is one test ({block, test, seed or weight, sim_args}), or a set:
+    {blocks: all or a list, or block: one, tests: names or globs, seeds: a
+    seed, a list or "a-b", or weight, sim_args: plusargs}. `blocks: all` is
     every block with a tests.yaml but the `held` ones, and skips a block
-    that lacks a test; a block named in the entry must have it. An entry
-    without seeds takes random ones, as many as --repeat."""
+    that lacks a test; a block named in the entry must have it. Without a
+    seed, a test runs once, or weight times --repeat, with random seeds.
+    An error starts with ``where``, the regression or the file."""
+    if not isinstance(e, dict) or "include" in e or not {"test", "tests"} & set(e):
+        why = ("include works only between named regressions (regressions:)"
+               if isinstance(e, dict) and "include" in e
+               else "an entry needs test (one test) or tests (a set)")
+        print_message("error", f"{where}: {e!r}: {why}")
+        exit(1)
+    one_test = "test" in e
+    keys = _ONE_TEST_KEYS if one_test else _SET_KEYS
+    if set(e) - keys:
+        print_message("error", f"{where}: {e!r}: {'one test' if one_test else 'a set'} takes "
+                               f"{', '.join(sorted(keys))}, not {', '.join(sorted(set(e) - keys))}")
+        exit(1)
+    if one_test:
+        if "block" not in e:
+            print_message("error", f"{where}: {e!r}: one test needs its block")
+            exit(1)
+        if isinstance(e["test"], list):
+            print_message("error", f"{where}: {e!r}: test takes one name; several go in tests")
+            exit(1)
+        return [dict(e)]
+    if "block" in e and "blocks" in e:
+        print_message("error", f"{where}: {e!r}: a set takes block (one) or blocks (all, or a list), not both")
+        exit(1)
+    every = "block" not in e and e.get("blocks", "all") == "all"
+    if every:
+        blocks = [b for b in blocks_with_tests() if b not in held]
+    else:
+        blocks = e["block"] if "block" in e else e["blocks"]
+        blocks = [blocks] if isinstance(blocks, str) else blocks
+    patterns = e["tests"] if isinstance(e["tests"], list) else [e["tests"]]
+    out = []
+    for block in blocks:
+        have = list(comp_of_tests(block))
+        if not have and not every:
+            print_message("error", f"{where}: no tests in verif/{block}/lib/tests.yaml")
+            exit(1)
+        for pattern in patterns:
+            names = [n for n in have if fnmatch.fnmatchcase(n, pattern)]
+            if not names and not every:
+                print_message("error", f"{where}: {block} has no test {pattern!r}; "
+                                       f"it has {', '.join(have)}")
+                exit(1)
+            for test in names:
+                one = {"block": block, "test": test, "sim_args": list(e.get("sim_args") or [])}
+                if "seeds" in e:
+                    out += [{**one, "seed": seed} for seed in _seeds(e["seeds"])]
+                else:
+                    out.append({**one, **({"weight": e["weight"]} if "weight" in e else {})})
+    return out
+
+
+def expand_regression(regressions, name, held, seen=()):
+    """The one-test entries of a named regression: those of each entry (see
+    :func:`expand_entry`), and of the regression an {include: <regression>}
+    entry names."""
     if name not in regressions:
         print_message("error", f"no regression {name!r}; there are {', '.join(regressions)}")
         exit(1)
@@ -653,43 +714,25 @@ def expand_regression(regressions, name, held, seen=()):
         exit(1)
     out = []
     for e in regressions[name] or []:
-        if "include" in e:
+        if isinstance(e, dict) and "include" in e:
+            if len(e) > 1:
+                print_message("error", f"regression {name!r}: {e!r}: include takes no other key")
+                exit(1)
             out += expand_regression(regressions, e["include"], held, seen + (name,))
             continue
-        if "block" in e:
-            out.append(dict(e))
-            continue
-        every = e.get("blocks", "all") == "all"
-        blocks = [b for b in blocks_with_tests() if b not in held] if every else e["blocks"]
-        patterns = e["tests"] if isinstance(e["tests"], list) else [e["tests"]]
-        for block in blocks:
-            have = list(comp_of_tests(block))
-            if not have and not every:
-                print_message("error", f"regression {name!r}: no tests in verif/{block}/lib/tests.yaml")
-                exit(1)
-            for pattern in patterns:
-                names = [n for n in have if fnmatch.fnmatchcase(n, pattern)]
-                if not names and not every:
-                    print_message("error", f"regression {name!r}: {block} has no test {pattern!r}; "
-                                           f"it has {', '.join(have)}")
-                    exit(1)
-                for test in names:
-                    one = {"block": block, "test": test, "sim_args": list(e.get("sim_args") or [])}
-                    if "seeds" in e:
-                        out += [{**one, "seed": seed} for seed in _seeds(e["seeds"])]
-                    else:
-                        out.append({**one, **({"weight": e["weight"]} if "weight" in e else {})})
+        out += expand_entry(e, held, f"regression {name!r}")
     return out
 
 
 def parse_test_list(file_path, regression=None):
     """The entries of a regression file and its settings.
 
-    A file is a list of tests (`tests:`, one entry a test), or named
-    regressions (`regressions:`, one picked with --regression; see
-    :func:`expand_regression`). Either may carry `held` (block: why, kept
-    out of `blocks: all`), `keep` (more file patterns a passing run keeps,
-    e.g. a bench's own coverage dump) and `hooks` (see :func:`run_hooks`).
+    A file is one list of entries (`tests:`, each one test or a set; see
+    :func:`expand_entry`), or named regressions (`regressions:`, one picked
+    with --regression; see :func:`expand_regression`). Either may carry
+    `held` (block: why, kept out of `blocks: all`), `keep` (more file
+    patterns a passing run keeps, e.g. a bench's own coverage dump) and
+    `hooks` (see :func:`run_hooks`).
     Read the way test_runner reads tests.yaml: Jinja rendered first."""
     try:
         with open(file_path, 'r') as f:
@@ -714,7 +757,8 @@ def parse_test_list(file_path, regression=None):
     if regression:
         print_message("error", f"--regression {regression}: {file_path} holds one list of tests")
         exit(1)
-    return content.get("tests", []), settings
+    return [one for e in content.get("tests") or []
+            for one in expand_entry(e, settings["held"], file_path)], settings
 
 
 def run_hooks(hooks, regression_dir, results, codecov, summary_path):

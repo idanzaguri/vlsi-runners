@@ -162,6 +162,11 @@ runner reports them so two forms of one design can be compared.
   `held` ones.
 - **held**: blocks kept out of every `blocks: all` entry, each with the reason.
 - **seeds**: an entry's seeds: one seed, a list, or a range `"a-b"`.
+- **Set**: a regression file entry that runs several tests: `tests` (names or
+  globs) on `blocks` (`all`, or a list) or on one `block`. A `tests:` list and a
+  named regression both take it.
+- **weight**: how many times an entry without a seed runs for each `--repeat`,
+  each run with its own random seed.
 - **include**: an entry that takes another named regression's entries.
 - **keep**: file patterns, in a regression file, that a passing run keeps on
   top of `test.log` and the coverage database.
