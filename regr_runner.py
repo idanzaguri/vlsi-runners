@@ -26,7 +26,7 @@ from tqdm import tqdm
 from test_runner import (ms_sim_passed, ms_sim_warn, ms_sim_fail, ms_sim_waive,
                          vcs_sim_passed, vcs_sim_warn, vcs_sim_fail, vcs_sim_waive,
                          vlt_sim_passed, vlt_sim_warn, vlt_sim_fail, vlt_sim_waive,
-                         coverage_table as vlt_coverage_table)
+                         coverage_table as vlt_coverage_table, snapshot_warnings)
 
 
 # ----------------------------------------------------------------------
@@ -79,7 +79,7 @@ def _head_before_finish(stdout):
     return stdout[:m.start()] if m else None
 
 
-def _verdict_from_output(head, simulator="modelsim", expect_fail=None):
+def _verdict_from_output(head, simulator="modelsim", expect_fail=None, build_warnings=()):
     """The verdict test_runner would have given a run whose exit code is
     lost, read from the simulator's output up to $finish (``head``).
 
@@ -92,8 +92,10 @@ def _verdict_from_output(head, simulator="modelsim", expect_fail=None):
     PASSED_WARN. The summary's counts must read UVM_ERROR : 0 and
     UVM_FATAL : 0, and a UVM_WARNING count above 0 makes it PASSED_WARN,
     which --pedant fails as it fails test_runner's exit code 2. A simulator
-    Fatal before $finish fails it. A test that declares expect_fail passes
-    only when the output failed and carries its text, as in test_runner."""
+    Fatal before $finish fails it. A warning of the build's vopt
+    (``build_warnings``, a Questa run of a snapshot) makes it PASSED_WARN,
+    as in test_runner. A test that declares expect_fail passes only when
+    the output failed and carries its text, as in test_runner."""
     passed, warn, fail, waive = _SIM_LOG_RULES.get(simulator, _SIM_LOG_RULES["modelsim"])
     status = scan_log_lines(head.splitlines(), passed, warn, fail, waive)[0]
     if status in ("PASSED", "PASSED_WARN"):
@@ -101,7 +103,7 @@ def _verdict_from_output(head, simulator="modelsim", expect_fail=None):
             status = "FAILED"
         elif re.search(r"^#? ?\*\* Fatal", head, re.M):
             status = "FAILED"
-        elif re.search(r"UVM_WARNING\s*:\s*[1-9]", head):
+        elif re.search(r"UVM_WARNING\s*:\s*[1-9]", head) or build_warnings:
             status = "PASSED_WARN"
     if expect_fail:
         failed = status not in ("PASSED", "PASSED_WARN")
@@ -466,6 +468,10 @@ def run_test(block, test, seed, rundir, codecov=False, simulator="modelsim",
     log_text = stdout + "\n" + stderr
     head = _head_before_finish(stdout)
     expect = expect_fail_of(block, test)
+    # test_runner counts the warnings of the snapshot's build in the verdict
+    # it gives, so a verdict read from the output counts them too
+    build_warnings = (snapshot_warnings(str(rundir), str(lib or "sv_tb_work"))
+                      if simulator == "modelsim" else [])
     notes, note = [], None
     if killed:
         if killed == "timeout":
@@ -476,7 +482,7 @@ def run_test(block, test, seed, rundir, codecov=False, simulator="modelsim",
                          f"{finish_grace}s after $finish, killed")
             note = f"killed {finish_grace}s after $finish"
         if head is not None:
-            status = _verdict_from_output(head, simulator, expect)
+            status = _verdict_from_output(head, simulator, expect, build_warnings)
             notes.append(f"the test had reached $finish, so its output up to there "
                          f"decides: {status}")
         else:
@@ -490,7 +496,7 @@ def run_test(block, test, seed, rundir, codecov=False, simulator="modelsim",
     elif job and _SLURM_LOST_RE.search(stderr):
         why = _SLURM_LOST_RE.search(stderr).group(0).strip()
         if head is not None:
-            status = _verdict_from_output(head, simulator, expect)
+            status = _verdict_from_output(head, simulator, expect, build_warnings)
             note = "Slurm ended its job after $finish"
             notes.append(f"Slurm ended the job after $finish (srun exit code {proc.returncode}: "
                          f"{why}), so the output up to $finish decides: {status}")
@@ -500,7 +506,7 @@ def run_test(block, test, seed, rundir, codecov=False, simulator="modelsim",
             notes.append(f"Slurm ended the job before $finish (srun exit code {proc.returncode}: {why})")
     elif _LICENSE_FAIL_RE.search(log_text):
         if head is not None:
-            status = _verdict_from_output(head, simulator, expect)
+            status = _verdict_from_output(head, simulator, expect, build_warnings)
             note = "its license process failed after $finish"
             notes.append(f"the simulator's license process failed after $finish (test_runner "
                          f"exit code {proc.returncode}), so the output up to $finish decides: {status}")

@@ -35,6 +35,11 @@ ms_sim_warn    = UVM_SIM_WARN  + [r"^# \*\* Warning:"]
 ms_sim_fail    = UVM_SIM_FAIL  + [r"^# \*\* Error:"]
 ms_sim_waive   = [r"Warning: \(vopt-10587\)", r"Warning: \(vopt-13408\) Code coverage", r"Warning: \(vopt-10908\) Some"]
 
+# vopt.log has vlog's line shapes; it waives the vopt notes that a run
+# which optimizes inside vsim waives
+ms_opt_warn    = ms_comp_warn
+ms_opt_waive   = ms_sim_waive
+
 # VCS
 vcs_comp_passed = [r"Chronologic VCS"]   # presence of the VCS banner is enough
 vcs_comp_warn   = [r"^Warning-\["]
@@ -127,25 +132,51 @@ def _snapshot_marker(simdir, lib):
     """Where a library records the optimized design unit built into it.
 
     Questa keeps optimized units inside the library, and `vdir` is the only
-    way to list them by name, so the builder leaves a one-line marker beside
-    the library instead: a runner can then tell a snapshot library from one
-    built before snapshots existed without spawning a tool."""
+    way to list them by name, so the builder leaves a marker beside the
+    library instead: a runner can then tell a snapshot library from one
+    built before snapshots existed without spawning a tool. Its first line
+    is the snapshot's name, and the lines after it are vopt's warnings."""
     path = lib if os.path.isabs(lib) else os.path.join(simdir, lib)
     return f"{path}.vopt"
 
 
-def _snapshot_name(simdir, lib):
-    """The snapshot in this library, or None."""
+def _snapshot_lines(simdir, lib):
     try:
         with open(_snapshot_marker(simdir, lib)) as f:
-            return f.read().strip() or None
+            return f.read().splitlines()
     except OSError:
-        return None
+        return []
 
 
-def _mark_snapshot(simdir, lib, name):
+def _snapshot_name(simdir, lib):
+    """The snapshot in this library, or None."""
+    lines = _snapshot_lines(simdir, lib)
+    return (lines[0].strip() or None) if lines else None
+
+
+def snapshot_warnings(simdir, lib):
+    """vopt's warnings from the build of this library's snapshot (logion_tb
+    issue 30). A run of the snapshot optimizes nothing, so its run.log does
+    not have them; the run adds them to its verdict, as a run that optimizes
+    inside vsim finds them in its run.log."""
+    return _snapshot_lines(simdir, lib)[1:]
+
+
+def _mark_snapshot(simdir, lib, name, warnings=()):
     with open(_snapshot_marker(simdir, lib), "w") as f:
-        f.write(f"{name}\n")
+        f.write("".join(f"{line}\n" for line in [name, *warnings]))
+
+
+def _vopt_warnings(simdir):
+    """The warnings in vopt.log that are not waived, printed."""
+    try:
+        with open(f"{simdir}/vopt.log", errors="replace") as f:
+            warnings = scan_log_lines(f, (), ms_opt_warn, (), ms_opt_waive)[2]
+    except OSError:
+        return []
+    for w in warnings:
+        print_message('warning', w)
+    return warnings
 
 
 def _clear_snapshot(simdir, lib):
@@ -282,11 +313,22 @@ def run_modelsim(args, simdir, sim_args, design_files=frozenset()):
                 print_message('error', f"Optimization Failed {r}")
                 print_message('error', f"LOG:  {simdir}/vopt.log")
                 exit(1)
-            _mark_snapshot(simdir, lib, snapshot)
+            # a warning that only the elaborated design shows (a part-select
+            # out of bounds through a parameter, vopt-2697) is in vopt.log
+            # alone: --pedant fails it here, as comp.log's, and every run of
+            # the snapshot counts it
+            opt_warnings = _vopt_warnings(simdir)
+            if opt_warnings and args.pedant:
+                print_message('error', "Optimization Failed: vopt warned, and --pedant fails a warning")
+                print_message('error', f"LOG:  {simdir}/vopt.log")
+                exit(1)
+            _mark_snapshot(simdir, lib, snapshot, opt_warnings)
 
     # run the snapshot when there is one; a library built before this change,
     # or a wave run, falls back to optimizing inside vsim exactly as before
     use_snapshot = (not waves) and _snapshot_name(simdir, lib) == snapshot
+    # this run optimizes nothing, so its run.log will not have vopt's warnings
+    opt_warnings = snapshot_warnings(simdir, lib) if use_snapshot else []
     target = snapshot if use_snapshot else args.top
     vsim_cmd = (f"vsim -c -onfinish stop -work {lib} -l run.log -do sim.do "
                 f"-sv_seed {args.seed} {target} {sim_args}")
@@ -327,7 +369,15 @@ def run_modelsim(args, simdir, sim_args, design_files=frozenset()):
         if r and not expect:
             print_message('error', f"Simulation Failed {r}")
             exit(1)
-        status = parse_log(f"{simdir}/run.log", ms_sim_passed, ms_sim_warn, ms_sim_fail, ms_sim_waive, True, True)
+        status = parse_log(f"{simdir}/run.log", ms_sim_passed, ms_sim_warn, ms_sim_fail, ms_sim_waive,
+                           not opt_warnings, True)
+        if opt_warnings:
+            if status == "PASSED":
+                status = "PASSED_WARN"
+            print_test_status(status)
+            print("\nWarning(s) of the snapshot's optimization (vopt.log of its build):")
+            for w in opt_warnings:
+                print_message('error', w)
         print("---")
         print(f"LOG:  {simdir}/run.log")
         if args.dump or args.dump_mem:

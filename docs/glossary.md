@@ -32,7 +32,9 @@ runner reports them so two forms of one design can be compared.
 - **Instrumenting**: compiling a unit with coverage counters in it.
   `-cover` instruments everything; `+cover=<types>+<unit>` only that unit.
 - **Snapshot / optimized design**: the `vopt` output that `vsim` runs
-  without optimizing again (`<top>_opt`).
+  without optimizing again (`<top>_opt`). The marker beside the library
+  (`<lib>.vopt`) holds its name and vopt's warnings; every run of the
+  snapshot counts those warnings.
 
 ## Regressions and simulator hangs (Questa)
 

@@ -41,7 +41,18 @@ runs against it with `--run-only --lib <that>/sv_tb_work`.
 A wave run (`--dump`) keeps the old path: the debug database is baked at optimization
 time, so `vsim` optimizes that one itself. A library built before this change has no
 snapshot and is run exactly as it used to be; a recompile clears the marker
-(`<lib>.vopt`) that records the snapshot's name.
+(`<lib>.vopt`) that records the snapshot's name and vopt's warnings.
+
+vopt's warnings count as the run's warnings (logion_tb issue 30). Some warnings come
+only from the elaborated design, for example a part-select out of bounds through a
+parameter (vopt-2697), so they are in `vopt.log` alone. Under `--pedant` a vopt warning
+fails the build, as a `comp.log` warning does. Without `--pedant` the build records it in
+the marker, and every run of the snapshot passes with warnings (exit 2). A regression
+builds without `--pedant`, so each test of that design is PASSED_WARN, which
+`regr_runner --pedant` fails. The vopt notes that a run waives are waived here too:
+vopt-10587 and vopt-10908 (`+acc`), and vopt-13408 (no coverage of UVM and other known
+IPs). A marker from an older runner holds the name alone, so its runs count no vopt
+warning.
 
 ### Code coverage (Questa)
 
@@ -90,8 +101,9 @@ green alone. `regr_runner` reads each test's output while it runs and handles bo
 
 A verdict read from the output follows test_runner's own rules for a simulation log:
 the UVM report summary must be there and read `UVM_ERROR : 0` and `UVM_FATAL : 0`, a
-simulator error or Fatal fails it, and a UVM warning (or a `UVM_WARNING` count above 0)
-or an unwaived simulator warning makes it PASSED_WARN, which `--pedant` fails. A test
+simulator error or Fatal fails it, and a UVM warning (or a `UVM_WARNING` count above 0),
+an unwaived simulator warning, or a warning of the build's vopt (Questa) makes it
+PASSED_WARN, which `--pedant` fails. A test
 that declares `expect_fail` passes only when the output failed and carries its text.
 `summary.txt` lists both kinds: `Reruns:` (seed, why, the lost run's log
 `test.try1.log`, the rerun's result) and `Judged from the output:`.
