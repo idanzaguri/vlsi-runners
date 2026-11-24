@@ -1104,6 +1104,29 @@ def generate_sim_command(args):
         run_modelsim(args, simdir, sim_args, design_files)
 
 
+#: The options a tests.yaml entry may set that the command line overrides. The
+#: entry's arguments are appended after the command line's, so the entry's
+#: value would win otherwise.
+CLI_WINS = ("--uvm_test", "--dut")
+
+
+def cli_wins(cli_args, entry_args, opts=CLI_WINS):
+    """``entry_args`` without each option of ``opts`` that ``cli_args`` sets
+    itself, as ``--opt value`` or ``--opt=value``."""
+    given = {o for o in opts for a in cli_args if a == o or a.startswith(o + "=")}
+    out, i = [], 0
+    while i < len(entry_args):
+        a = entry_args[i]
+        if a in given:
+            i += 2                      # the option and its value
+        elif any(a.startswith(o + "=") for o in given):
+            i += 1
+        else:
+            out.append(a)
+            i += 1
+    return out
+
+
 def parse_test_args(block, test):
     """Retrieve compilation and simulation arguments for a specific test, and
     the name of its compilation."""
@@ -1188,7 +1211,10 @@ def main():
                              "verilator takes the executable from PATH and the UVM 1.2 source "
                              "from $UVM_HOME (default: the one in the Questa install); see README 'Verilator'.")
     parser.add_argument('--top', type=str, default='tb', help="Set top module name (default: tb)")
-    parser.add_argument('--dut', type=str, help="Set top module name (default: tb)")
+    parser.add_argument('--dut', type=str, help="The instance whose signals --dump and "
+                        "--dump-mem log and whose code coverage --codecov saves, as the simulator "
+                        "names it: /<top>/dut on Questa, <top>.dut on Verilator (default: --top, "
+                        "the whole bench). It overrides the --dut of the test's tests.yaml entry")
     parser.add_argument("--clean", action="store_true", help="clean run directory")
     parser.add_argument("--pedant", action="store_true", help="Stop run when there are warnings")
     parser.add_argument("--rundir", type=str, help="Set user-defined rundir")
@@ -1233,13 +1259,12 @@ def main():
     if args.test:
         expect_fail = test_expectation(args.block, args.test)
         additional_args, comp = parse_test_args(args.block, args.test)
-        # A CLI --uvm_test overrides the one baked into tests.yaml (yaml args are
-        # appended last and would otherwise win), so a custom test can run against an
-        # existing net's compilation, e.g. --uvm_test cn_directed_example.
-        if "--uvm_test" in original_args:
-            while "--uvm_test" in additional_args:
-                i = additional_args.index("--uvm_test")
-                del additional_args[i:i+2]
+        # A CLI --uvm_test or --dut overrides the one baked into tests.yaml (yaml
+        # args are appended last and would otherwise win): a custom test can run
+        # against an existing net's compilation (--uvm_test cn_directed_example),
+        # and a wave run can log the design alone where the entry names the
+        # whole bench (--dut /<top>/dut).
+        additional_args = cli_wins(original_args, additional_args)
         try:
             args = parser.parse_args(original_args + additional_args)
         except SystemExit:

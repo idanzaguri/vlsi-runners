@@ -17,7 +17,9 @@ the runner code lives here.
 | `pnr_runner.py` | place-and-time on a public library (OpenROAD), diff two designs | `python3 bin/runners/pnr_runner.py -b <block_a> --vs <block_b> --period 1.0` |
 
 `test_runner` selects the test from `verif/<block>/lib/tests.yaml`; a CLI `--uvm_test`
-overrides the one baked into the entry (handy for many flavors of one test class).
+or `--dut` overrides the one baked into the entry (handy for many flavors of one test
+class, and for waves of the design alone: `--dump --dut /<top>/dut` on Questa logs that
+instance and below, where the entry's `--dut` is usually the whole bench).
 `regr_runner --tests` takes a regression file: one list of entries, or several named
 regressions (see 'Regression files' below).
 
